@@ -11,7 +11,7 @@ export interface StackFieldSchema {
 }
 
 interface TypeCondition {
-  if: { properties: { type: { const?: string; enum?: string[] } } };
+  if: { properties: Record<string, { const?: string; enum?: string[] }>; required?: string[] };
   then: { required: string[] };
 }
 
@@ -40,11 +40,18 @@ ajv.addKeyword({
 export const validateDeployConfig = ajv.compile(schema);
 export const STACK_TYPES = schema.$defs.stack.properties.type?.enum ?? [];
 
-/** Fields the schema requires for `type`, besides id and type, in schema order. */
+/**
+ * Fields the schema requires for `type`, besides id and type, in schema order.
+ * Conditions that also depend on another field (build_target, for example) are
+ * not unconditional requirements of the type.
+ */
 export function requiredStackFields(type: string): string[] {
   return schema.$defs.stack.allOf
     .filter(({ if: condition }) => {
-      const { const: single, enum: anyOf } = condition.properties.type;
+      const keys = Object.keys(condition.properties);
+      if (keys.length !== 1 || keys[0] !== "type") return false;
+      if ((condition.required ?? ["type"]).some((field) => field !== "type")) return false;
+      const { const: single, enum: anyOf } = condition.properties.type ?? {};
       return single === type || (anyOf?.includes(type) ?? false);
     })
     .flatMap((rule) => rule.then.required);

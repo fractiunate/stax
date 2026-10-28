@@ -1,0 +1,13 @@
+stacks:
+  - id: golden-azure
+    type: packer
+    packer_directory: packer/ubuntu
+    packer_template: azure.pkr.hcl
+    packer_version: "1.11.2"
+    azure:
+      image_resource_group_name: rg-images
+      gallery_name: corp_gallery
+      image_definition_name: ubuntu2404
+      image_version: "1.2.3"
+      target_regions: [westeurope, northeurope]
+    output-var: [image_id, image_ref, build_target, version]

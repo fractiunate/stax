@@ -122,6 +122,73 @@ function packerPathProblem(value: string): string | undefined {
   return undefined;
 }
 
+const GALLERY_FIELDS = [
+  "image_resource_group_name",
+  "gallery_name",
+  "image_definition_name",
+  "image_version",
+  "target_regions",
+] as const;
+
+const RESERVED_SNAPSHOT_LABELS = ["managed_by", "stax_stack_id", "stax_env", "stax_git_sha", "stax_build_target"];
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/** build_target rules that JSON Schema if/then cannot express: aliases, conflicts, and the AWS stub. */
+function checkPackerBuildTarget(stack: Record<string, unknown>, index: number, report: Reporter): void {
+  const target = stack.build_target === undefined ? "azure" : stack.build_target;
+  if (target !== "azure" && target !== "hetzner" && target !== "aws") return;
+
+  if (target === "aws") {
+    report.add("warning", ["stacks", index, "build_target"], "aws is reserved and not implemented; the workflow rejects it until an AMI executor exists");
+  }
+
+  for (const field of GALLERY_FIELDS) {
+    if (stack[field] !== undefined) {
+      report.add("warning", ["stacks", index, field], `deprecated alias of azure.${field}; move it under azure`);
+    }
+  }
+
+  const azure = isRecord(stack.azure) ? stack.azure : undefined;
+  if (azure) {
+    for (const field of GALLERY_FIELDS) {
+      if (stack[field] !== undefined && azure[field] !== undefined && !sameJson(stack[field], azure[field])) {
+        report.add("error", ["stacks", index, "azure", field], `conflicts with deprecated alias ${field}`);
+      }
+    }
+  }
+
+  if (target === "azure" && stack.hetzner !== undefined) {
+    report.add("error", ["stacks", index, "hetzner"], "does not apply when build_target is azure");
+  }
+  if (target === "azure" && stack.aws !== undefined) {
+    report.add("error", ["stacks", index, "aws"], "does not apply when build_target is azure");
+  }
+  if (target === "hetzner" && (azure || GALLERY_FIELDS.some((field) => stack[field] !== undefined))) {
+    report.add("error", ["stacks", index, "build_target"], "hetzner does not use Azure Gallery fields");
+  }
+  if (target === "hetzner" && stack.aws !== undefined) {
+    report.add("error", ["stacks", index, "aws"], "does not apply when build_target is hetzner");
+  }
+  if (target === "aws" && (azure || stack.hetzner !== undefined || GALLERY_FIELDS.some((field) => stack[field] !== undefined))) {
+    report.add("error", ["stacks", index, "build_target"], "aws does not use Azure Gallery or Hetzner fields");
+  }
+
+  if (isRecord(stack.hetzner) && isRecord(stack.hetzner.snapshot_labels)) {
+    for (const key of RESERVED_SNAPSHOT_LABELS) {
+      if (stack.hetzner.snapshot_labels[key] !== undefined) {
+        report.add("warning", ["stacks", index, "hetzner", "snapshot_labels", key], "reserved label; STAX overwrites it");
+      }
+    }
+  }
+
+  if ((stack.destroy === true || stack.destroy === "true") && target !== "hetzner") {
+    report.add("warning", ["stacks", index, "destroy"], "Packer destroy is only supported for build_target hetzner; Azure Gallery builds stay build-only");
+  }
+}
+
 /** Collects stack.<id>.var|secret.<key> references in an input value, like update_deploy_config. */
 function collectStackReferences(value: unknown, path: Path, out: { path: Path; ref: string }[]): void {
   if (typeof value === "string") {
@@ -184,6 +251,9 @@ function checkPipelineRules(data: Record<string, unknown>, report: Reporter): vo
         const problem = typeof value === "string" ? packerPathProblem(value) : undefined;
         if (problem) report.add("error", ["stacks", index, field], problem);
       }
+      checkPackerBuildTarget(stack, index, report);
+    } else if (stack.build_target !== undefined) {
+      report.add("warning", ["stacks", index, "build_target"], "applies to packer stacks only");
     }
 
     // Mirrors validateGitHubPagesConfig and github-pages-config.mjs.

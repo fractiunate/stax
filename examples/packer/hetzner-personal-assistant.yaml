@@ -1,0 +1,19 @@
+# Reference consumer shape for the personal-assistant Hetzner golden image:
+# packer/personal-assistant, cax11 (arm64), Ubuntu 24.04. The template owns the
+# source block; this stack tells STAX where to publish the snapshot.
+stacks:
+  - id: golden-hetzner
+    type: packer
+    packer_directory: packer/personal-assistant
+    packer_template: .
+    packer_version: "1.16.1"
+    build_target: hetzner
+    hetzner:
+      location: fsn1
+      server_type: cax11
+      snapshot_name: personal-assistant-golden
+      snapshot_labels:
+        personal-assistant: "true"
+        role: golden
+      keep_last: 3
+    output-var: [image_id, image_ref, build_target, version, labels]

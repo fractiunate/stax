@@ -39,6 +39,16 @@ on:
     outputs:
       image_id:
         value: ${{ jobs.Packer.outputs.image_id }}
+      image_ref:
+        value: ${{ jobs.Packer.outputs.image_ref }}
+      build_target:
+        value: ${{ jobs.Packer.outputs.build_target }}
+      version:
+        value: ${{ jobs.Packer.outputs.version }}
+      labels:
+        value: ${{ jobs.Packer.outputs.labels }}
+      git_sha:
+        value: ${{ jobs.Packer.outputs.git_sha }}
       site_url:
         value: ${{ jobs.github-pages.outputs.site-url }}
 
@@ -78,6 +88,8 @@ on:
       GPG_PASSPHRASE:
         required: false
       CI_ENV_TRANSFER_GH_TOKEN:
+        required: false
+      HCLOUD_TOKEN:
         required: false
 
 jobs:

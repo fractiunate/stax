@@ -126,7 +126,7 @@
           "examples": ["main"],
           "x-stax-types": ["terraform", "opentofu", "packer", "swa-site-deploy", "swa-docs-site-deploy", "s3-site-deploy", "script", "bizep", "github-pages-site-deploy"]
         },
-        "destroy": { "description": "Destroy the stack instead of deploying it.", "type": ["boolean", "string"], "examples": [false], "x-stax-types": ["terraform", "opentofu", "swa-site-deploy", "swa-docs-site-deploy"] },
+        "destroy": { "description": "Destroy the stack instead of deploying it. For Packer, only build_target hetzner honors this; Azure Gallery builds stay build-only.", "type": ["boolean", "string"], "examples": [false], "x-stax-types": ["terraform", "opentofu", "packer", "swa-site-deploy", "swa-docs-site-deploy"] },
 
         "folder": {
           "description": "Stack directory: below stack_base_path for terraform/opentofu, below functions/ for function-build-deploy.",
@@ -146,6 +146,71 @@
         "packer_directory": { "description": "Packer project path, relative to the source repository.", "$ref": "#/$defs/relativePath", "examples": ["packer/ubuntu"], "x-stax-types": ["packer"] },
         "packer_template": { "description": "Template file or directory relative to packer_directory; defaults to '.'.", "$ref": "#/$defs/relativePath", "examples": ["azure.pkr.hcl"], "x-stax-types": ["packer"] },
         "packer_version": { "description": "Exact Packer version.", "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$", "examples": ["1.11.2"], "x-stax-types": ["packer"] },
+        "build_target": {
+          "description": "Packer publisher. Omit or set azure for Compute Gallery. hetzner publishes a labelled snapshot and requires hetzner. aws is reserved and not implemented.",
+          "enum": ["azure", "hetzner", "aws"],
+          "default": "azure",
+          "examples": ["azure"],
+          "x-stax-types": ["packer"]
+        },
+        "azure": {
+          "description": "Azure Compute Gallery destination. Required on apply unless the same fields are still set as deprecated aliases or stack inputs.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image_resource_group_name": { "type": "string", "minLength": 1, "examples": ["rg-images"] },
+            "gallery_name": { "type": "string", "minLength": 1, "examples": ["corp_gallery"] },
+            "image_definition_name": { "type": "string", "minLength": 1, "examples": ["ubuntu2404"] },
+            "image_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$", "examples": ["1.2.3"] },
+            "target_regions": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "examples": [["westeurope", "northeurope"]] }
+          },
+          "examples": [{
+            "image_resource_group_name": "rg-images",
+            "gallery_name": "corp_gallery",
+            "image_definition_name": "ubuntu2404",
+            "image_version": "1.2.3",
+            "target_regions": ["westeurope", "northeurope"]
+          }],
+          "x-stax-types": ["packer"]
+        },
+        "hetzner": {
+          "description": "Hetzner snapshot destination. Required when build_target is hetzner. cax* server types are arm64; the template's source image must match.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["location", "server_type"],
+          "properties": {
+            "location": { "description": "Hetzner location, for example fsn1.", "type": "string", "pattern": "^[a-z]{2,4}[0-9]?$", "examples": ["fsn1"] },
+            "server_type": { "description": "Temporary build server type, for example cax11.", "type": "string", "pattern": "^[a-z][a-z0-9]{1,31}$", "examples": ["cax11"] },
+            "snapshot_name": { "description": "Snapshot name. Defaults to the stack id.", "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$", "examples": ["personal-assistant-golden"] },
+            "snapshot_labels": {
+              "description": "Extra snapshot labels. STAX adds stax_stack_id, stax_env, stax_git_sha, stax_build_target and managed_by=stax.",
+              "type": "object",
+              "additionalProperties": { "type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$" },
+              "propertyNames": { "pattern": "^[A-Za-z](?:[A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$" },
+              "examples": [{ "personal-assistant": "true", "role": "golden" }]
+            },
+            "keep_last": { "description": "Matching snapshots to retain after a successful build. Default 3. 0 keeps only the snapshot just built; on destroy, 0 deletes every match.", "type": "integer", "minimum": 0, "maximum": 100, "default": 3, "examples": [3] }
+          }
+        },
+        "aws": {
+          "description": "Reserved for a later AMI publisher. build_target aws is rejected by the workflow.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["regions"],
+          "properties": {
+            "regions": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "pattern": "^[a-z]{2}-[a-z]+-[0-9]+$" },
+              "examples": [["eu-central-1"]]
+            }
+          }
+        },
+        "image_resource_group_name": { "description": "Deprecated alias of azure.image_resource_group_name.", "type": "string", "minLength": 1 },
+        "gallery_name": { "description": "Deprecated alias of azure.gallery_name.", "type": "string", "minLength": 1 },
+        "image_definition_name": { "description": "Deprecated alias of azure.image_definition_name.", "type": "string", "minLength": 1 },
+        "image_version": { "description": "Deprecated alias of azure.image_version.", "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "target_regions": { "description": "Deprecated alias of azure.target_regions.", "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
 
         "image_name": { "type": "string", "examples": ["my-app"], "x-stax-types": ["docker-build-push"] },
         "dockerfile_folder": { "description": "Build context containing the Dockerfile.", "type": "string", "examples": ["docker/my-app"], "x-stax-types": ["docker-build-push"] },
@@ -184,6 +249,20 @@
         {
           "if": { "properties": { "type": { "const": "packer" } }, "required": ["type"] },
           "then": { "required": ["packer_directory", "packer_version"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "packer" }, "build_target": { "const": "hetzner" } },
+            "required": ["type", "build_target"]
+          },
+          "then": { "required": ["hetzner"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "packer" }, "build_target": { "const": "aws" } },
+            "required": ["type", "build_target"]
+          },
+          "then": { "required": ["aws"] }
         },
         {
           "if": { "properties": { "type": { "const": "s3-site-deploy" } }, "required": ["type"] },

@@ -27,6 +27,30 @@ export interface ITerraformConfig {
     packer_directory?: string;
     packer_template?: string;
     packer_version?: string;
+    build_target?: 'azure' | 'hetzner' | 'aws';
+    azure?: {
+        image_resource_group_name?: string;
+        gallery_name?: string;
+        image_definition_name?: string;
+        image_version?: string;
+        target_regions?: string[];
+    };
+    hetzner?: {
+        location?: string;
+        server_type?: string;
+        snapshot_name?: string;
+        snapshot_labels?: Record<string, string>;
+        keep_last?: number;
+    };
+    aws?: {
+        regions?: string[];
+    };
+    image_resource_group_name?: string;
+    gallery_name?: string;
+    image_definition_name?: string;
+    image_version?: string;
+    target_regions?: string[];
+    destroy?: boolean | string;
 }
 export interface IExternalRepoEntry {
     repoURL: string;

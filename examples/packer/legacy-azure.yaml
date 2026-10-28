@@ -1,0 +1,16 @@
+# A 1.5.0 Packer stack: no build_target, Gallery fields supplied as inputs.
+stacks:
+  - id: golden-azure
+    type: packer
+    packer_directory: packer/ubuntu
+    packer_template: azure.pkr.hcl
+    packer_version: "1.11.2"
+    input:
+      - image_resource_group_name: rg-images
+      - gallery_name: corp_gallery
+      - image_definition_name: ubuntu2404
+      - image_version: "1.2.3"
+      - target_regions:
+          - westeurope
+          - northeurope
+    output-var: [image_id]

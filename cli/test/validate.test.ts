@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -242,6 +242,80 @@ stacks:
     },
   ])("warns about $name without failing", ({ config, expected }) => {
     expect(brief(validateConfigText(config))).toEqual([{ ...expected, message: expect.stringContaining(expected.message) }]);
+  });
+
+  it("accepts a legacy Packer stack and a Hetzner stack, and warns that AWS is not implemented", () => {
+    const legacy = `stacks:
+  - id: img
+    type: packer
+    packer_directory: images/ubuntu
+    packer_template: azure.pkr.hcl
+    packer_version: "1.11.2"
+    input:
+      - gallery_name: corp_gallery
+`;
+    expect(validateConfigText(legacy)).toEqual([]);
+
+    const hetzner = `stacks:
+  - id: golden-hetzner
+    type: packer
+    packer_directory: packer/personal-assistant
+    packer_template: .
+    packer_version: "1.16.1"
+    build_target: hetzner
+    hetzner:
+      location: fsn1
+      server_type: cax11
+      snapshot_name: personal-assistant-golden
+      snapshot_labels:
+        personal-assistant: "true"
+        role: golden
+      keep_last: 3
+    output-var: [image_id, image_ref, build_target, version, labels]
+`;
+    expect(validateConfigText(hetzner)).toEqual([]);
+
+    const aws = `stacks:
+  - id: golden-aws
+    type: packer
+    packer_directory: packer/ami
+    packer_version: "1.16.1"
+    build_target: aws
+    aws:
+      regions: [eu-central-1]
+`;
+    expect(brief(validateConfigText(aws))).toEqual([
+      { severity: "warning", line: 6, message: expect.stringContaining("aws is reserved and not implemented") },
+    ]);
+  });
+
+  it("rejects a Hetzner target without hetzner and conflicting Gallery aliases", () => {
+    const missing = brief(validateConfigText("stacks:\n  - id: img\n    type: packer\n    packer_directory: images\n    packer_version: 1.11.2\n    build_target: hetzner\n"));
+    expect(missing).toContainEqual({ severity: "error", line: 2, message: expect.stringContaining('missing required field "hetzner"') });
+
+    const conflict = brief(validateConfigText(`stacks:
+  - id: img
+    type: packer
+    packer_directory: images
+    packer_version: "1.11.2"
+    gallery_name: old
+    azure:
+      gallery_name: new
+`));
+    expect(conflict).toEqual(expect.arrayContaining([
+      expect.objectContaining({ severity: "error", message: expect.stringContaining("conflicts with deprecated alias gallery_name") }),
+      expect.objectContaining({ severity: "warning", message: expect.stringContaining("deprecated alias of azure.gallery_name") }),
+    ]));
+  });
+
+  it("validates the Packer examples", () => {
+    const directory = join(import.meta.dirname, "../../examples/packer");
+    for (const name of ["legacy-azure.yaml", "azure.yaml", "hetzner-personal-assistant.yaml"]) {
+      expect(validateConfigText(readFileSync(join(directory, name), "utf8")), name).toEqual([]);
+    }
+    const aws = brief(validateConfigText(readFileSync(join(directory, "aws-reserved.yaml"), "utf8")));
+    expect(aws).toEqual([expect.objectContaining({ severity: "warning", message: expect.stringContaining("not implemented") })]);
+    expect(aws.filter((finding) => finding.severity === "error")).toEqual([]);
   });
 });
 
