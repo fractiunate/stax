@@ -34,6 +34,8 @@ jobs:
         cache-dependency-path: cli/package-lock.json
     - run: npm ci
     - run: npm run build
+    - name: Check Jobs API assertion state transitions
+      run: node --test ../e2e/assert/run.test.mjs ../.github/scripts/e2e-trusted-run.test.mjs
     - name: Create a project with stax init and stax add
       env:
         FRAMEWORK_REF: ${{ github.event.pull_request.head.sha || github.sha }}

@@ -31,7 +31,7 @@ deployment:
 stacks: []
 ```
 
-Selecting `configs/prod.yaml` uses its `stage`, resource group and state container. Supply the remaining required values through GitHub variables or add them to that selected YAML. Add a stack to the selected file before deploying; setup rejects an empty stack list.
+Selecting `configs/prod.yaml` uses its `stage`, resource group and state container. Supply the remaining required values through GitHub variables or add them to that selected YAML. A config without stacks deploys nothing; the CLI's `validate config --strict` reports it.
 
 The setup workflow reads only the files you select. `configs/default.yaml` is a normal config file: it contributes no values when you select `prod`. The same rule applies to external configuration repositories.
 
@@ -57,6 +57,18 @@ Precedence per field is selected YAML → GitHub variable. An empty string or `n
 | `state_resource_group_name` | `STATE_RESOURCE_GROUP_NAME` | Required for Azure |
 | `state_bucket_name` | `STATE_BUCKET_NAME` | Required for AWS |
 | `state_region` | `STATE_REGION` | Required for AWS |
+| `aws_endpoint_url` | `AWS_ENDPOINT_URL` | Optional, AWS only; base endpoint for every AWS service |
+| `aws_endpoint_url_s3` | `AWS_ENDPOINT_URL_S3` | Optional, AWS only; S3 endpoint for the state backend and the AWS provider |
+| `aws_endpoint_url_sts` | `AWS_ENDPOINT_URL_STS` | Optional, AWS only; not supported with `OIDC_ENABLED` |
+| `aws_endpoint_url_iam` | `AWS_ENDPOINT_URL_IAM` | Optional, AWS only |
+| `aws_s3_compatible` | `AWS_S3_COMPATIBLE` | Optional, AWS only; boolean, default `false` |
+| `aws_skip_sts_check` | `AWS_SKIP_STS_CHECK` | Optional, AWS only; boolean, default `false` |
+| `state_use_lockfile` | `STATE_USE_LOCKFILE` | Optional, AWS only; boolean, default `true` |
+| `state_use_path_style` | `STATE_USE_PATH_STYLE` | Optional, AWS only; boolean, default `false` |
+
+The optional AWS fields target S3-compatible storage such as Wasabi or MinIO; see [Backends](backends.md#s3-compatible-storage). Endpoint URLs must use `https` (`http` only for `localhost`, `127.0.0.1` or `[::1]`) and cannot contain credentials, query strings, fragments, whitespace or backslashes. Setting one of them to a non-default value with another cloud fails the setup.
+
+These requirements apply to stack deployments. A state config, resolved with `config-profile: state`, needs only the backend fields; see [Backends](backends.md).
 
 ## Stack conditions
 

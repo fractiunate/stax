@@ -1,0 +1,9 @@
+---
+# State-backend config used by e2e-config.yml: setup (config-profile: state) and a dry run of
+# a-wf-deploy-state.yml. Nothing is deployed; names are fixtures only.
+deployment:
+  cloud: Azure
+  default_location: WestEurope
+  state_resource_group_name: rg-e2e-tfstate
+  state_storage_account_name: st-e2e-state
+  state_container_name: e2e-tfstate

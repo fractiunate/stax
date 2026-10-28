@@ -19,7 +19,7 @@ on:
         type: string
       actions-version:
         required: false
-        default: "1.3.3"
+        default: "1.5.0"
         description: "Github Repo branch for shared actions."
         type: string
       actions-repository:

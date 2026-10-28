@@ -101,6 +101,64 @@ describe('validatePackerConfig', () => {
     )
   })
 
+  it('accepts a Hetzner target and warns that AWS is not implemented', () => {
+    const warnings: string[] = []
+    expect(() =>
+      validatePackerConfig(
+        validPackerConfig({
+          build_target: 'hetzner',
+          hetzner: { location: 'fsn1', server_type: 'cax11', keep_last: 3 }
+        }),
+        (message) => warnings.push(message)
+      )
+    ).not.toThrow()
+    expect(warnings).toEqual([])
+
+    expect(() =>
+      validatePackerConfig(
+        validPackerConfig({
+          build_target: 'aws',
+          aws: { regions: ['eu-central-1'] }
+        }),
+        (message) => warnings.push(message)
+      )
+    ).not.toThrow()
+    expect(warnings.join('\n')).toMatch(/not implemented/)
+  })
+
+  it('rejects a Hetzner target without its object and an Azure target that carries one', () => {
+    expect(() =>
+      validatePackerConfig(validPackerConfig({ build_target: 'hetzner' }))
+    ).toThrow(/requires a hetzner object/)
+    expect(() =>
+      validatePackerConfig(
+        validPackerConfig({
+          hetzner: { location: 'fsn1', server_type: 'cax11' }
+        })
+      )
+    ).toThrow(/does not apply/)
+  })
+
+  it('warns on deprecated Gallery aliases and rejects conflicts', () => {
+    const warnings: string[] = []
+    validatePackerConfig(
+      validPackerConfig({ gallery_name: 'corp_gallery' }),
+      (message) => warnings.push(message)
+    )
+    expect(warnings.join('\n')).toMatch(
+      /deprecated alias of azure.gallery_name/
+    )
+
+    expect(() =>
+      validatePackerConfig(
+        validPackerConfig({
+          gallery_name: 'old',
+          azure: { gallery_name: 'new' }
+        })
+      )
+    ).toThrow(/conflicts with deprecated alias gallery_name/)
+  })
+
   it('does not impose Packer requirements on non-Packer stacks', () => {
     const config: ITerraformConfig = {
       id: 'terraform-stack',

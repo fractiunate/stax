@@ -176,7 +176,7 @@ export async function run(): Promise<void> {
     validateGitHubPagesConfig(deploy_config, global_vars)
 
     for (const config of deploy_config) {
-      validatePackerConfig(config)
+      validatePackerConfig(config, (message) => core.warning(message))
       validateStackFolder(config)
     }
 

@@ -1,2 +1,2 @@
 import { ITerraformConfig } from './types.js';
-export declare function validatePackerConfig(config: ITerraformConfig): void;
+export declare function validatePackerConfig(config: ITerraformConfig, warn?: (message: string) => void): void;

@@ -1,0 +1,9 @@
+# Valid to author. The workflow rejects build_target aws until an AMI executor exists.
+stacks:
+  - id: golden-aws
+    type: packer
+    packer_directory: packer/ami
+    packer_version: "1.16.1"
+    build_target: aws
+    aws:
+      regions: [eu-central-1]

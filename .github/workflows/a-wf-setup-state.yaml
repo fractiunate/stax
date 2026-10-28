@@ -37,7 +37,17 @@ on:
         required: false
         type: string
         default: ""
-        description: "Container name (defaults to customer_id-tfstate, e.g. default-tfstate)"
+        description: "Container name (defaults to customer_id-tfstate, e.g. default-tfstate; ignored when create-container is false)"
+      create-container:
+        required: false
+        type: boolean
+        default: true
+        description: "Create the state container. false: deploy only the resource group and storage account"
+      location:
+        required: false
+        type: string
+        default: ""
+        description: "Azure location for new resources (defaults to the location variable, then northeurope)"
       cloud:
         required: false
         type: string
@@ -53,6 +63,36 @@ on:
         type: string
         default: ""
         description: "AWS region hosting the state bucket (defaults to the STATE_REGION or DEFAULT_LOCATION variable)"
+      aws_endpoint_url:
+        required: false
+        type: string
+        default: ""
+        description: "Base endpoint for all AWS services, e.g. a MinIO server (defaults to the AWS_ENDPOINT_URL variable; cloud: aws)"
+      aws_endpoint_url_s3:
+        required: false
+        type: string
+        default: ""
+        description: "S3 endpoint of an S3-compatible store, e.g. https://s3.eu-central-2.wasabisys.com (defaults to the AWS_ENDPOINT_URL_S3 variable; cloud: aws)"
+      aws_endpoint_url_sts:
+        required: false
+        type: string
+        default: ""
+        description: "STS endpoint (defaults to the AWS_ENDPOINT_URL_STS variable; cloud: aws)"
+      aws_s3_compatible:
+        required: false
+        type: string
+        default: ""
+        description: "'true' for S3-compatible stores: versioning stays mandatory, the other bucket hardening steps only warn when unsupported (defaults to the AWS_S3_COMPATIBLE variable, else false)"
+      aws_skip_sts_check:
+        required: false
+        type: string
+        default: ""
+        description: "'true' skips the STS identity check for stores without STS (defaults to the AWS_SKIP_STS_CHECK variable, else false)"
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+        description: "Only report what would change (cloud: aws). Read-only: no bucket is created or modified."
     secrets:
       ARM_CLIENT_ID:
         required: false
@@ -79,6 +119,7 @@ jobs:
     - name: Validate cloud
       env:
         CLOUD: ${{ inputs.cloud }}
+        DRY_RUN: ${{ inputs.dry_run }}
       run: |
         case "$CLOUD" in
           azure|aws) ;;
@@ -87,6 +128,10 @@ jobs:
             exit 1
             ;;
         esac
+        if [ "$CLOUD" != "aws" ] && [ "$DRY_RUN" = "true" ]; then
+          echo "::error::dry_run is only supported for cloud: aws."
+          exit 1
+        fi
 
   setup:
     name: "Setup TF State (Azure)"
@@ -101,7 +146,7 @@ jobs:
       ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID || secrets.ARM_SUBSCRIPTION_ID }}
       ARM_USE_OIDC: ${{ vars.OIDC_ENABLED || 'false' }}
       ARM_USE_AZUREAD: ${{ vars.OIDC_ENABLED || 'false' }}
-      LOCATION: ${{ vars.location || 'northeurope' }}
+      LOCATION: ${{ inputs.location || vars.location || 'northeurope' }}
     steps:
     - name: Validate required envs
       id: validate
@@ -149,7 +194,9 @@ jobs:
         fi
 
         CONTAINER_NAME="${{ inputs.container_name }}"
-        if [ -z "$CONTAINER_NAME" ]; then
+        if [[ "${{ inputs.create-container }}" != "true" ]]; then
+          CONTAINER_NAME=""
+        elif [ -z "$CONTAINER_NAME" ]; then
           CONTAINER_NAME="${CUSTOMER_ID}-tfstate"
         fi
 
@@ -270,12 +317,8 @@ jobs:
 
         # Determine state based on both checks
         if [[ "$sa_exists" == "true" && "$sa_resource_group" != "$resource_group" ]]; then
-          # Storage account exists in a different resource group - ERROR
-          echo "[ERROR] Storage account '${storage_account}' exists in resource group '${sa_resource_group}', expected '${resource_group}'"
-          echo "sa_exists=true" >> "$GITHUB_OUTPUT"
-          echo "sa_in_different_rg=true" >> "$GITHUB_OUTPUT"
-          echo "rg_exists=true" >> "$GITHUB_OUTPUT"
-          echo "sa_container_exists=false" >> "$GITHUB_OUTPUT"
+          echo "::error::Storage account '${storage_account}' exists in resource group '${sa_resource_group}', expected '${resource_group}'"
+          exit 1
         elif [[ "$sa_exists" == "true" && "$sa_resource_group" == "$resource_group" ]]; then
           # Storage account exists in the correct resource group
           echo "[INFO] Use existing Storage Account ${storage_account} in resource group ${resource_group}"
@@ -309,11 +352,13 @@ jobs:
           # END TLS_VERSION_FIX
 
           # Check if container exists
-          sa_container_exists=$(az storage container exists --account-name ${storage_account} \
-            --account-key "${key}" --name "${shared_container}" -o tsv | tr '[:upper:]' '[:lower:]')
-          if [[ $sa_container_exists == "true" ]]; then
-            echo "[INFO] Use existing Storage Container ${shared_container}"
-            echo "sa_container_exists=true" >> "$GITHUB_OUTPUT"
+          if [ -n "${shared_container}" ]; then
+            sa_container_exists=$(az storage container exists --account-name ${storage_account} \
+              --account-key "${key}" --name "${shared_container}" -o tsv | tr '[:upper:]' '[:lower:]')
+            if [[ $sa_container_exists == "true" ]]; then
+              echo "[INFO] Use existing Storage Container ${shared_container}"
+              echo "sa_container_exists=true" >> "$GITHUB_OUTPUT"
+            fi
           fi
         elif [[ "$sa_exists" == "false" && "$rg_exists" == "true" ]]; then
           # RG exists but SA doesn't - need to create SA
@@ -329,6 +374,11 @@ jobs:
           echo "sa_exists=false" >> "$GITHUB_OUTPUT"
           echo "sa_in_different_rg=false" >> "$GITHUB_OUTPUT"
           echo "sa_container_exists=false" >> "$GITHUB_OUTPUT"
+        fi
+
+        if [ -z "${shared_container}" ]; then
+          echo "[INFO] No container requested; deploying the storage account only"
+          echo "sa_container_exists=skipped" >> "$GITHUB_OUTPUT"
         fi
 
         echo "location=${location}" >> "$GITHUB_OUTPUT"
@@ -349,7 +399,7 @@ jobs:
       run: |
         storage_account="${{ steps.init-base.outputs.storage_account }}"
         resource_group="${{ steps.init-base.outputs.resource_group }}"
-
+        location="${{ steps.init-base.outputs.location }}"
         echo "[INFO] Ensure Storage Account ${storage_account} in resource group ${resource_group}"
 
         existing_rg=$(az storage account show \
@@ -367,7 +417,7 @@ jobs:
           az storage account update \
             --resource-group "${resource_group}" \
             --name "${storage_account}" \
-            --allow-blob-public-access true \
+            --allow-blob-public-access false \
             --min-tls-version TLS1_2 \
             --tags owner="GithubActions" repository="${GITHUB_REPOSITORY}" project="tf-states" stage=tf-states
         else
@@ -376,9 +426,10 @@ jobs:
           create_output=$(az storage account create \
             --resource-group "${resource_group}" \
             --name "${storage_account}" \
+            --location "${location}" \
             --sku Standard_LRS \
             --encryption-services blob \
-            --allow-blob-public-access true \
+            --allow-blob-public-access false \
             --tags owner="GithubActions" repository="${GITHUB_REPOSITORY}" project="tf-states" stage=tf-states \
             --min-tls-version TLS1_2 2>&1)
           create_exit=$?
@@ -396,7 +447,7 @@ jobs:
               az storage account update \
                 --resource-group "${resource_group}" \
                 --name "${storage_account}" \
-                --allow-blob-public-access true \
+                --allow-blob-public-access false \
                 --min-tls-version TLS1_2 \
                 --tags owner="GithubActions" repository="${GITHUB_REPOSITORY}" project="tf-states" stage=tf-states
             else
@@ -411,6 +462,11 @@ jobs:
 
     - name: secure-sa
       run: |
+        # Terraform state is never served anonymously; this also closes accounts created with public access.
+        az storage account update \
+          --resource-group ${{ steps.init-base.outputs.resource_group }} \
+          --name ${{ steps.init-base.outputs.storage_account }} \
+          --allow-blob-public-access false
         az storage account blob-service-properties update \
           --resource-group ${{ steps.init-base.outputs.resource_group }} \
           --account-name ${{ steps.init-base.outputs.storage_account }} \
@@ -427,7 +483,7 @@ jobs:
           -n ${{ steps.init-base.outputs.storage_account}} --query "[0].{value:value}" --output tsv)"
         echo "[INFO] Create Storage Container ${{ steps.init-base.outputs.storage_container}}"
         az storage container create --name ${{ steps.init-base.outputs.storage_container}} \
-          --account-name ${{ steps.init-base.outputs.storage_account}} --account-key "${key}"
+          --account-name ${{ steps.init-base.outputs.storage_account}} --account-key "${key}" --public-access off
 
     - name: get-ids
       id: get-ids
@@ -454,7 +510,7 @@ jobs:
         echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
         echo "| Resource Group: \`${{ steps.resolve-config.outputs.TF_VAR_state_resource_group_name }}\` | Exists: ${{ steps.init-base.outputs.rg_exists }} |" >> $GITHUB_STEP_SUMMARY
         echo "| Storage Account: \`${{ steps.resolve-config.outputs.TF_VAR_state_storage_account_name }}\` | Exists: ${{ steps.init-base.outputs.sa_exists }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Container: \`${{ steps.resolve-config.outputs.TF_VAR_state_storage_container_name }}\` | Exists: ${{ steps.init-base.outputs.sa_container_exists }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Container: \`${{ steps.resolve-config.outputs.TF_VAR_state_storage_container_name || '(none requested)' }}\` | Exists: ${{ steps.init-base.outputs.sa_container_exists }} |" >> $GITHUB_STEP_SUMMARY
 
   setup-aws:
     name: "Setup TF State (AWS)"
@@ -469,11 +525,52 @@ jobs:
       AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN || secrets.AWS_ROLE_ARN }}
       AWS_REGION: ${{ inputs.region || vars.STATE_REGION || vars.DEFAULT_LOCATION }}
       OIDC_ENABLED: ${{ vars.OIDC_ENABLED || 'false' }}
+      INPUT_AWS_ENDPOINT_URL: ${{ inputs.aws_endpoint_url || vars.AWS_ENDPOINT_URL }}
+      INPUT_AWS_ENDPOINT_URL_S3: ${{ inputs.aws_endpoint_url_s3 || vars.AWS_ENDPOINT_URL_S3 }}
+      INPUT_AWS_ENDPOINT_URL_STS: ${{ inputs.aws_endpoint_url_sts || vars.AWS_ENDPOINT_URL_STS }}
+      S3_COMPATIBLE: ${{ inputs.aws_s3_compatible || vars.AWS_S3_COMPATIBLE || 'false' }}
+      SKIP_STS_CHECK: ${{ inputs.aws_skip_sts_check || vars.AWS_SKIP_STS_CHECK || 'false' }}
+      DRY_RUN: ${{ inputs.dry_run }}
     steps:
     - name: Resolve config
       id: resolve-config
       run: |
         set -euo pipefail
+
+        for flag in S3_COMPATIBLE SKIP_STS_CHECK; do
+          if [[ "${!flag}" != 'true' && "${!flag}" != 'false' ]]; then
+            echo "::error::${flag} must be 'true' or 'false' (got '${!flag}')."
+            exit 1
+          fi
+        done
+
+        # This job only manages the state bucket, so the endpoints can apply to the whole job.
+        for name in AWS_ENDPOINT_URL AWS_ENDPOINT_URL_S3 AWS_ENDPOINT_URL_STS; do
+          input="INPUT_${name}"
+          value="${!input}"
+          value="${value#"${value%%[![:space:]]*}"}"
+          value="${value%"${value##*[![:space:]]}"}"
+          if [ -z "$value" ]; then continue; fi
+          if [[ "$value" == *\\* || "$value" =~ [[:space:]@?#] || ! "$value" =~ ^(https://|http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/|$)) ]] \
+            || ! node -e 'try { new URL(process.argv[1]); } catch { process.exit(1); }' "$value"; then
+            echo "::error::${name} must be a valid https URL without credentials, query or fragment (http only for localhost)."
+            exit 1
+          fi
+          if [ "${OIDC_ENABLED}" = "true" ] && [ "$name" != "AWS_ENDPOINT_URL_S3" ]; then
+            echo "::error::OIDC_ENABLED cannot be combined with ${name}; use static AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY secrets."
+            exit 1
+          fi
+          echo "[INFO] ${name}=${value}"
+          echo "${name}=${value}" >> "$GITHUB_ENV"
+        done
+        if [ "${S3_COMPATIBLE}" = "true" ]; then
+          echo "[INFO] S3-compatible mode"
+          {
+            echo "AWS_REQUEST_CHECKSUM_CALCULATION=when_required"
+            echo "AWS_RESPONSE_CHECKSUM_VALIDATION=when_required"
+          } >> "$GITHUB_ENV"
+        fi
+        if [ "${DRY_RUN}" = "true" ]; then echo "[INFO] Dry run: read-only checks, nothing is created or changed."; fi
 
         if [ -z "${AWS_REGION}" ]; then
           echo "::error::No AWS region resolved. Pass the 'region' input or set the DEFAULT_LOCATION (or STATE_REGION) variable."
@@ -581,6 +678,7 @@ jobs:
         echo "AWS_DEFAULT_REGION=${AWS_REGION}" >> "$GITHUB_ENV"
 
     - name: Verify identity
+      if: env.SKIP_STS_CHECK != 'true'
       run: aws sts get-caller-identity
 
     - name: Ensure state bucket
@@ -591,20 +689,37 @@ jobs:
         bucket="${{ steps.resolve-config.outputs.bucket_name }}"
         region="${{ steps.resolve-config.outputs.region }}"
 
+        # Unsupported hardening APIs are optional for compatible stores; transport and
+        # authorization failures are not. Never report a failed security operation as success.
+        harden() {
+          local what="$1" err; shift
+          err=$(mktemp)
+          if "$@" 2>"$err"; then
+            rm -f "$err"
+          elif [ "${S3_COMPATIBLE}" = "true" ] && grep -qiE 'NotImplemented|NotSupported|UnsupportedOperation|UnsupportedFeature|\(501\)' "$err"; then
+            echo "::warning::${what} is not supported by this S3-compatible endpoint; configure it in the provider console if available."
+            rm -f "$err"
+          else
+            cat "$err" >&2
+            rm -f "$err"
+            return 1
+          fi
+        }
+
         head_err=$(mktemp)
         if aws s3api head-bucket --bucket "$bucket" 2>"$head_err"; then
           echo "[INFO] Use existing bucket ${bucket}"
           bucket_exists=true
           rm -f "$head_err"
-        elif grep -qE '403|Forbidden' "$head_err"; then
-          echo "::error::Bucket '${bucket}' exists but is not accessible with these credentials. S3 bucket names are global across all AWS accounts: it either belongs to another account or the credentials lack access to it. Pick a different STATE_BUCKET_NAME."
-          sed 's/^/[aws] /' "$head_err" >&2
-          rm -f "$head_err"
-          exit 1
-        else
+        elif grep -qE '(^|[^0-9])404([^0-9]|$)|NoSuchBucket|Not Found' "$head_err"; then
+          if [ "${DRY_RUN}" = "true" ]; then
+            rm -f "$head_err"
+            echo "[DRY-RUN] Would create bucket ${bucket} in ${region} and enable versioning, encryption, public access block, TLS-only policy and tags."
+            echo "bucket_exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           rm -f "$head_err"
           echo "[INFO] Create bucket ${bucket} in ${region}"
-
           create_err=$(mktemp)
           set +e
           if [ "$region" = "us-east-1" ]; then
@@ -615,34 +730,49 @@ jobs:
           fi
           create_exit=$?
           set -e
-
           if [ $create_exit -ne 0 ]; then
             if grep -q 'BucketAlreadyExists' "$create_err"; then
               echo "::error::Bucket name '${bucket}' is already taken in another AWS account. S3 bucket names are globally unique; pick a different STATE_BUCKET_NAME."
             fi
-            sed 's/^/[aws] /' "$create_err" >&2
+            cat "$create_err" >&2
             rm -f "$create_err"
             exit $create_exit
           fi
           rm -f "$create_err"
-
           aws s3api wait bucket-exists --bucket "$bucket"
           bucket_exists=false
+        else
+          cat "$head_err" >&2
+          rm -f "$head_err"
+          echo "::error::Cannot determine whether bucket '${bucket}' exists; refusing to create or assume it is absent."
+          exit 1
         fi
 
-        aws s3api put-public-access-block --bucket "$bucket" \
+        if [ "${DRY_RUN}" = "true" ]; then
+          versioning=$(aws s3api get-bucket-versioning --bucket "$bucket" --query Status --output text)
+          echo "[DRY-RUN] Bucket ${bucket} exists; versioning status: ${versioning}."
+          echo "[DRY-RUN] Would (re)apply versioning, encryption, public access block, TLS-only policy and managed tags."
+          echo "bucket_exists=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        harden "Public access block" aws s3api put-public-access-block --bucket "$bucket" \
           --public-access-block-configuration \
           BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 
         aws s3api put-bucket-versioning --bucket "$bucket" \
           --versioning-configuration Status=Enabled
 
-        aws s3api put-bucket-encryption --bucket "$bucket" \
+        harden "Default bucket encryption" aws s3api put-bucket-encryption --bucket "$bucket" \
           --server-side-encryption-configuration \
           '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
 
         # put-bucket-policy replaces the whole policy, so merge by Sid and keep other statements.
-        partition=$(aws sts get-caller-identity --query Arn --output text | cut -d: -f2)
+        if [ "${SKIP_STS_CHECK}" = "true" ]; then
+          partition="aws"
+        else
+          partition=$(aws sts get-caller-identity --query Arn --output text | cut -d: -f2)
+        fi
         bucket_arn="arn:${partition}:s3:::${bucket}"
         tls_statement=$(jq -nc --arg arn "$bucket_arn" '{
           Sid: "DenyInsecureTransport", Effect: "Deny", Principal: "*", Action: "s3:*",
@@ -650,46 +780,62 @@ jobs:
           Condition: {Bool: {"aws:SecureTransport": "false"}}
         }')
         policy_err=$(mktemp)
+        policy_ok=true
         if ! current_policy=$(aws s3api get-bucket-policy --bucket "$bucket" --query Policy --output text 2>"$policy_err"); then
-          if ! grep -q 'NoSuchBucketPolicy' "$policy_err"; then
+          if grep -q 'NoSuchBucketPolicy' "$policy_err"; then
+            current_policy='{}'
+          elif [ "${S3_COMPATIBLE}" = "true" ] && grep -qiE 'NotImplemented|NotSupported|UnsupportedOperation|UnsupportedFeature|\(501\)' "$policy_err"; then
+            echo "::warning::Reading the bucket policy failed on this S3-compatible endpoint; TLS-only policy not applied."
+            policy_ok=false
+          else
             sed 's/^/[aws] /' "$policy_err" >&2
             rm -f "$policy_err"
             exit 1
           fi
-          current_policy='{}'
         fi
         rm -f "$policy_err"
-        new_policy=$(jq -c --argjson stmt "$tls_statement" '
-          .Version //= "2012-10-17"
-          | .Statement = ([.Statement // [] | if type == "array" then .[] else . end
-              | select(.Sid != "DenyInsecureTransport")] + [$stmt])' <<<"$current_policy")
-        echo "[INFO] Enforce TLS-only access (bucket policy statement DenyInsecureTransport)"
-        aws s3api put-bucket-policy --bucket "$bucket" --policy "$new_policy"
+        if [ "$policy_ok" = "true" ]; then
+          new_policy=$(jq -c --argjson stmt "$tls_statement" '
+            .Version //= "2012-10-17"
+            | .Statement = ([.Statement // [] | if type == "array" then .[] else . end
+                | select(.Sid != "DenyInsecureTransport")] + [$stmt])' <<<"$current_policy")
+          echo "[INFO] Enforce TLS-only access (bucket policy statement DenyInsecureTransport)"
+          harden "TLS-only bucket policy" aws s3api put-bucket-policy --bucket "$bucket" --policy "$new_policy"
+        fi
 
         # put-bucket-tagging replaces the whole tag set, so merge to keep tags set by others.
         tag_err=$(mktemp)
+        tags_ok=true
         if ! current_tags=$(aws s3api get-bucket-tagging --bucket "$bucket" --query TagSet --output json 2>"$tag_err"); then
-          if ! grep -q 'NoSuchTagSet' "$tag_err"; then
+          if grep -q 'NoSuchTagSet' "$tag_err"; then
+            current_tags='[]'
+          elif [ "${S3_COMPATIBLE}" = "true" ] && grep -qiE 'NotImplemented|NotSupported|UnsupportedOperation|UnsupportedFeature|\(501\)' "$tag_err"; then
+            echo "::warning::Reading bucket tags failed on this S3-compatible endpoint; managed tags not applied."
+            tags_ok=false
+          else
             sed 's/^/[aws] /' "$tag_err" >&2
             rm -f "$tag_err"
             exit 1
           fi
-          current_tags='[]'
         fi
         rm -f "$tag_err"
-        new_tags=$(jq -c --arg repo "$GITHUB_REPOSITORY" '
-          [{Key: "owner", Value: "GithubActions"}, {Key: "repository", Value: $repo},
-           {Key: "project", Value: "tf-states"}, {Key: "stage", Value: "tf-states"}] as $managed
-          | map(select(.Key as $k | $managed | map(.Key) | index($k) | not)) + $managed' <<<"$current_tags")
-        echo "[INFO] Apply managed bucket tags (other tags are kept)"
-        aws s3api put-bucket-tagging --bucket "$bucket" --tagging "{\"TagSet\":${new_tags}}"
+        if [ "$tags_ok" = "true" ]; then
+          new_tags=$(jq -c --arg repo "$GITHUB_REPOSITORY" '
+            [{Key: "owner", Value: "GithubActions"}, {Key: "repository", Value: $repo},
+             {Key: "project", Value: "tf-states"}, {Key: "stage", Value: "tf-states"}] as $managed
+            | map(select(.Key as $k | $managed | map(.Key) | index($k) | not)) + $managed' <<<"$current_tags")
+          echo "[INFO] Apply managed bucket tags (other tags are kept)"
+          harden "Bucket tagging" aws s3api put-bucket-tagging --bucket "$bucket" --tagging "{\"TagSet\":${new_tags}}"
+        fi
 
         echo "bucket_exists=${bucket_exists}" >> "$GITHUB_OUTPUT"
 
     - name: Summary
       run: |
+        title="## TF State Setup Summary (AWS)"
+        if [ "${DRY_RUN}" = "true" ]; then title="${title} (dry run)"; fi
         {
-          echo "## TF State Setup Summary (AWS)"
+          echo "$title"
           echo ""
           echo "| Resource | Status |"
           echo "|----------|--------|"

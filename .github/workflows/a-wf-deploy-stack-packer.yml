@@ -21,11 +21,26 @@ on:
       actions-version:
         type: string
         required: false
-        default: "1.3.3"
+        default: "1.5.0"
     outputs:
       image_id:
-        description: "Full Azure Compute Gallery image version resource ID after replication is complete"
-        value: ${{ jobs.packer.outputs.image_id }}
+        description: "Cloud-native image id (Gallery version resource id or Hetzner snapshot id)"
+        value: ${{ jobs.azure.outputs.image_id || jobs.hetzner.outputs.image_id }}
+      image_ref:
+        description: "Opaque locator azure:gallery:... or hcloud:snapshot:<id>"
+        value: ${{ jobs.azure.outputs.image_ref || jobs.hetzner.outputs.image_ref }}
+      build_target:
+        description: "azure, hetzner, or aws"
+        value: ${{ jobs.azure.outputs.build_target || jobs.hetzner.outputs.build_target }}
+      version:
+        description: "Gallery image version, or 0.0.0+<git sha> for Hetzner"
+        value: ${{ jobs.azure.outputs.version || jobs.hetzner.outputs.version }}
+      labels:
+        description: "JSON object of tags or snapshot labels"
+        value: ${{ jobs.azure.outputs.labels || jobs.hetzner.outputs.labels }}
+      git_sha:
+        description: "Source commit recorded for this build"
+        value: ${{ jobs.azure.outputs.git_sha || jobs.hetzner.outputs.git_sha }}
     secrets:
       ARM_CLIENT_SECRET:
         required: false
@@ -41,968 +56,82 @@ on:
         required: false
       CI_ENV_TRANSFER_GH_TOKEN:
         required: false
+      HCLOUD_TOKEN:
+        required: false
 
 permissions:
   contents: read
   id-token: write
 
 jobs:
-  packer:
-    name: "Packer ${{ fromJson(inputs.data)['name'] || fromJson(inputs.data)['id'] }}"
-    runs-on: ${{ fromJson(inputs.data)['runs-on'] || vars.RUNNER || 'ubuntu-22.04' }}
-    environment: ${{ fromJson(inputs.env)['environment'] || 'dev' }}
+  route:
+    name: "Select Packer build target"
+    runs-on: ubuntu-latest
     outputs:
-      image_id: ${{ steps.publish.outputs.image_id }}
-      transfer_requested: ${{ steps.preflight.outputs.transfer-requested }}
-      actions_sha: ${{ steps.resolve-actions-ref.outputs.sha }}
-    env:
-      ENVIRONMENT: ${{ fromJson(inputs.env)['environment'] || 'dev' }}
-      ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID || secrets.ARM_CLIENT_ID }}
-      ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID || secrets.ARM_TENANT_ID }}
-      ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
-      ARM_USE_OIDC: ${{ vars.OIDC_ENABLED || 'false' }}
-      ARM_USE_AZUREAD: ${{ vars.OIDC_ENABLED || 'false' }}
+      build_target: ${{ steps.select.outputs.build_target }}
     steps:
-    - name: Validate request before checkout
-      id: preflight
+    - name: Select publisher
+      id: select
       shell: bash
       env:
         DATA_JSON: ${{ inputs.data }}
-        PIPELINE_ENV_JSON: ${{ inputs.env }}
-        EXTERNAL_REPOS_JSON: ${{ inputs.external-repos || '[]' }}
-        ACTIONS_REPOSITORY: ${{ inputs.actions-repository }}
-        ACTIONS_VERSION: ${{ inputs.actions-version }}
-        KEY_VAULT_URL: ${{ vars.REPO_KEYSTORE_KEY_VAULT_URL }}
-        TRANSFER_PAT_AVAILABLE: ${{ secrets.CI_ENV_TRANSFER_GH_TOKEN != '' && 'true' || 'false' }}
-        TRANSFER_APP_CREDENTIALS_AVAILABLE: ${{ (vars.RELEASE_APP_CLIENT_ID != '' || vars.RELEASE_GH_APP_ID != '') && (secrets.RELEASE_APP_CLIENT_SECRET
-          != '' || secrets.RELEASE_GH_APP_PRIVATE_KEY != '') && 'true' || 'false' }}
       run: |
         set -euo pipefail
-
         jq -e 'type == "object"' <<< "$DATA_JSON" > /dev/null || {
           echo "::error::Packer data must be a JSON object."
           exit 1
         }
-        jq -e 'type == "object"' <<< "$PIPELINE_ENV_JSON" > /dev/null || {
-          echo "::error::Packer env must be a JSON object."
-          exit 1
-        }
-        jq -e 'type == "object" or (type == "array" and length == 0)' <<< "$EXTERNAL_REPOS_JSON" > /dev/null || {
-          echo "::error::external-repos must be a JSON object or an empty array."
-          exit 1
-        }
-
-        if [[ "$ACTIONS_REPOSITORY" != "GEBITSolutions/stax" ]]; then
-          echo "::error::Packer trusted actions must come from GEBITSolutions/stax."
-          exit 1
-        fi
-        if [[ "$ACTIONS_VERSION" != "main" && ! "$ACTIONS_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ && ! "$ACTIONS_VERSION" =~ ^[0-9a-fA-F]{40}$ ]]; then
-          echo "::error::actions-version must be main, a numeric semantic version tag with optional v prefix, or a full 40-character commit SHA."
-          exit 1
-        fi
-
-        parse_flag() {
-          local key="$1"
-          local default_value="$2"
-          jq -r --arg key "$key" --arg default_value "$default_value" '
-            if (has($key) | not) then
-              $default_value
-            elif (.[$key] | type) == "boolean" then
-              (.[$key] | tostring)
-            elif (.[$key] | type) == "string" and (.[$key] == "true" or .[$key] == "false") then
-              .[$key]
-            else
-              error($key + " must be the literal true or false")
-            end
-          ' <<< "$PIPELINE_ENV_JSON"
-        }
-
-        dry_run="$(parse_flag dry_run true)" || {
-          echo "::error::dry_run must be the literal true or false."
-          exit 1
-        }
-        destroy="$(parse_flag destroy false)" || {
-          echo "::error::destroy must be the literal true or false."
-          exit 1
-        }
-
-        if [[ "$destroy" == "true" ]]; then
-          echo "::error::Packer stacks are build-only; destroy is not supported."
-          exit 1
-        fi
-
         if [[ "$(jq -r '.type // empty' <<< "$DATA_JSON")" != "packer" ]]; then
           echo "::error::The Packer executor only accepts descriptors with type 'packer'."
           exit 1
         fi
-
-        packer_version="$(jq -er 'if (.packer_version | type) == "string" then .packer_version else error("packer_version must be a string") end' <<< "$DATA_JSON")" || {
-          echo "::error::packer_version must be an exact version string."
-          exit 1
-        }
-        if [[ ! "$packer_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          echo "::error::packer_version must be an exact numeric version such as 1.11.2."
-          exit 1
-        fi
-
-        validate_relative_path() {
-          local value="$1"
-          local label="$2"
-
-          if [[ -z "$value" || "$value" == /* || "$value" =~ ^[A-Za-z]: || "$value" == *\\* || "$value" == *//* || "$value" == */ ]]; then
-            echo "::error::$label must be a nonempty repository-relative POSIX path."
-            exit 1
-          fi
-          if [[ "$value" =~ (^|/)\.\.(/|$) ]]; then
-            echo "::error::$label must not contain a '..' path segment."
-            exit 1
-          fi
-        }
-
-        packer_directory="$(jq -er '
-          if (.packer_directory | type) == "string" and (.packer_directory | explode | all(. >= 32 and . != 127)) then
-            .packer_directory
+        build_target="$(jq -r '
+          if has("build_target") | not then
+            "azure"
+          elif (.build_target | type) == "string" then
+            .build_target
           else
-            error("packer_directory must be a string without control characters")
+            "invalid"
           end
-        ' <<< "$DATA_JSON")" || {
-          echo "::error::packer_directory must be a string without control characters."
-          exit 1
-        }
-        packer_template="$(jq -er '
-          if has("packer_template") | not then
-            "."
-          elif (.packer_template | type) == "string" and (.packer_template | explode | all(. >= 32 and . != 127)) then
-            .packer_template
-          else
-            error("packer_template must be a string without control characters")
-          end
-        ' <<< "$DATA_JSON")" || {
-          echo "::error::packer_template must be a string without control characters."
-          exit 1
-        }
-        validate_relative_path "$packer_directory" packer_directory
-        validate_relative_path "$packer_template" packer_template
-        if ! jq -e '
-          if type == "object" then
-            all(keys[]; test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and . != "." and . != "..")
-          else
-            true
-          end
-        ' <<< "$EXTERNAL_REPOS_JSON" > /dev/null; then
-          echo "::error::Every external-repos alias must be a safe single path component."
-          exit 1
-        fi
-
-        excluded_secret_names="$(jq -cn --argjson external_repos "$EXTERNAL_REPOS_JSON" '
-          [
-            "ARM_CLIENT_ID",
-            "ARM_CLIENT_SECRET",
-            "ARM_SUBSCRIPTION_ID",
-            "ARM_TENANT_ID",
-            "CI_ENV_TRANSFER_GH_TOKEN",
-            "CI_GITHUB_TOKEN_SHARED_CODE",
-            "RELEASE_APP_CLIENT_SECRET",
-            "RELEASE_GH_APP_PRIVATE_KEY",
-            "REPO_KEYSTORE_SP_CLIENT_SECRET"
-          ] + (
-            if ($external_repos | type) == "object" then
-              [
-                $external_repos[]
-                | select(type == "array" and length > 0 and (.[0] | type) == "object")
-                | .[0].token?
-                | select(type == "string" and length > 0)
-              ]
-            else
-              []
-            end
-          )
-          | unique
-        ')"
-
-        source_alias="$(jq -er '
-          if has("source_repo") | not then ""
-          elif (.source_repo | type) == "string" then .source_repo
-          else error("source_repo must be a string")
-          end
-        ' <<< "$DATA_JSON")" || {
-          echo "::error::source_repo must be a string."
-          exit 1
-        }
-        if [[ -n "$source_alias" ]] && ! jq -e --arg alias "$source_alias" '
-          type == "object" and has($alias) and (.[$alias] | type == "array") and (.[$alias] | length > 0)
-        ' <<< "$EXTERNAL_REPOS_JSON" > /dev/null; then
-          echo "::error::source_repo alias '$source_alias' was not found in external-repos."
-          exit 1
-        fi
-
-        output_requested="$(jq -r '
-          (."output-var" // []) as $outputs
-          | if ($outputs | type) != "array" or any($outputs[]; type != "string") then
-              error("output-var must be an array of strings")
-            else
-              ($outputs | index("image_id") != null)
-            end
-        ' <<< "$DATA_JSON")" || {
-          echo "::error::output-var must be an array of strings."
-          exit 1
-        }
-
-        if [[ "$output_requested" == "true" ]]; then
-          stack_id="$(jq -r '.id // empty' <<< "$DATA_JSON" | tr '-' '_')"
-          if [[ ! "$stack_id" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-            echo "::error::Stack id cannot be converted to a valid output variable prefix."
+        ' <<< "$DATA_JSON")"
+        case "$build_target" in
+          azure|hetzner)
+            ;;
+          aws)
+            echo "::error::build_target aws is reserved and not implemented. Outputs stay image_id, image_ref, build_target, version, labels and git_sha when an AMI workflow is added."
             exit 1
-          fi
-
-          if [[ "$dry_run" == "false" ]]; then
-            if [[ -z "$ENVIRONMENT" ]]; then
-              echo "::error::An environment is required to transfer image_id."
-              exit 1
-            fi
-            if [[ -z "$KEY_VAULT_URL" && "$TRANSFER_PAT_AVAILABLE" != "true" && "$TRANSFER_APP_CREDENTIALS_AVAILABLE" != "true" ]]; then
-              echo "::error::No GitHub transfer credential is configured for the requested image_id transfer."
-              exit 1
-            fi
-          fi
-        fi
-
-        if [[ "$dry_run" == "false" && -z "$ARM_SUBSCRIPTION_ID" ]]; then
-          echo "::error::The nonsecret Environment variable ARM_SUBSCRIPTION_ID is required for a Packer build."
-          exit 1
-        fi
-
-        {
-          echo "dry-run=$dry_run"
-          echo "packer-version=$packer_version"
-          echo "transfer-requested=$output_requested"
-          echo "actions-version=$ACTIONS_VERSION"
-          echo "excluded-secret-names=$excluded_secret_names"
-        } >> "$GITHUB_OUTPUT"
-
-    - name: Resolve App Token Scope
-      id: token-scope
-      shell: bash
-      env:
-        EXTERNAL_REPOS_JSON: ${{ inputs.external-repos || '[]' }}
-      run: |
-        set -euo pipefail
-        repositories="${GITHUB_REPOSITORY#*/}"
-        while read -r repo_url; do
-          repo_ref="$(sed -E 's#.*github\.com[:/]([^/]+)/([^/.]+)(\.git)?$#\1/\2#' <<< "$repo_url")"
-          repo_owner="${repo_ref%%/*}"
-          repo_name="${repo_ref#*/}"
-          if [[ "$repo_owner" == "$GITHUB_REPOSITORY_OWNER" && "$repo_name" != "$repo_ref" && ",${repositories}," != *",${repo_name},"* ]]; then
-            repositories="${repositories},${repo_name}"
-          fi
-        done < <(jq -r 'if type == "object" then .[] | .[0].repoURL // empty else empty end' <<< "$EXTERNAL_REPOS_JSON")
-        echo "repositories=$repositories" >> "$GITHUB_OUTPUT"
-
-    - name: Generate GitHub App Token
-      id: app-token
-      if: ${{ vars.RELEASE_APP_CLIENT_ID != '' || vars.RELEASE_GH_APP_ID != '' }}
-      continue-on-error: true
-      uses: actions/create-github-app-token@v3
-      with:
-        client-id: ${{ vars.RELEASE_APP_CLIENT_ID || vars.RELEASE_GH_APP_ID }}
-        private-key: ${{ secrets.RELEASE_APP_CLIENT_SECRET || secrets.RELEASE_GH_APP_PRIVATE_KEY }}
-        owner: ${{ github.repository_owner }}
-        repositories: ${{ steps.token-scope.outputs.repositories }}
-        permission-contents: read
-
-    - name: Resolve trusted actions revision
-      id: resolve-actions-ref
-      shell: bash
-      env:
-        ACTIONS_VERSION: ${{ steps.preflight.outputs.actions-version }}
-      run: |
-        set -euo pipefail
-
-        github_api() {
-          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/GEBITSolutions/stax/$1"
-        }
-
-        if [[ "$ACTIONS_VERSION" == "main" ]]; then
-          response="$(github_api "git/ref/heads/main")" || {
-            echo "::error::Unable to resolve the approved trusted actions main branch."
+            ;;
+          *)
+            echo "::error::build_target must be azure, hetzner, or aws."
             exit 1
-          }
-          resolved_sha="$(jq -er '.object | select(.type == "commit") | .sha | select(type == "string")' <<< "$response")" || {
-            echo "::error::GitHub returned an invalid trusted actions main revision."
-            exit 1
-          }
-        elif [[ "$ACTIONS_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          response="$(github_api "git/ref/tags/${ACTIONS_VERSION}")" || {
-            echo "::error::Unable to resolve the approved trusted actions version tag."
-            exit 1
-          }
-          object_type="$(jq -er '.object.type | select(type == "string")' <<< "$response")"
-          object_sha="$(jq -er '.object.sha | select(type == "string")' <<< "$response")"
-          resolved_sha=""
-          for ((depth = 0; depth < 10; depth++)); do
-            if [[ "$object_type" == "commit" ]]; then
-              resolved_sha="$object_sha"
-              break
-            fi
-            if [[ "$object_type" != "tag" || ! "$object_sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
-              break
-            fi
-            response="$(github_api "git/tags/${object_sha}")" || {
-              echo "::error::Unable to resolve the approved annotated trusted actions tag."
-              exit 1
-            }
-            object_type="$(jq -er '.object.type | select(type == "string")' <<< "$response")"
-            object_sha="$(jq -er '.object.sha | select(type == "string")' <<< "$response")"
-          done
-        else
-          response="$(github_api "commits/${ACTIONS_VERSION}")" || {
-            echo "::error::Unable to resolve the approved trusted actions commit SHA."
-            exit 1
-          }
-          resolved_sha="$(jq -er '.sha | select(type == "string")' <<< "$response")" || {
-            echo "::error::GitHub returned an invalid trusted actions commit revision."
-            exit 1
-          }
-          if [[ "${resolved_sha,,}" != "${ACTIONS_VERSION,,}" ]]; then
-            echo "::error::actions-version must identify the exact trusted actions commit."
-            exit 1
-          fi
-        fi
-
-        if [[ ! "$resolved_sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
-          echo "::error::GitHub did not resolve the trusted actions revision to a full commit SHA."
-          exit 1
-        fi
-        resolved_sha="${resolved_sha,,}"
-        echo "sha=$resolved_sha" >> "$GITHUB_OUTPUT"
+            ;;
+        esac
+        echo "build_target=$build_target" >> "$GITHUB_OUTPUT"
         # shellcheck disable=SC2016 # Backticks are literal Markdown delimiters.
-        printf '### Trusted actions\n\n- Resolved SHA: `%s`\n' "$resolved_sha" >> "$GITHUB_STEP_SUMMARY"
+        printf '### Packer build target\n\n- build_target: `%s`\n' "$build_target" >> "$GITHUB_STEP_SUMMARY"
 
-    - name: Prepare trusted actions checkout
-      shell: bash
-      run: |
-        set -euo pipefail
-        rm -rf -- "$GITHUB_WORKSPACE/trusted-actions"
+  azure:
+    needs: route
+    if: needs.route.outputs.build_target == 'azure'
+    name: "Packer Azure: ${{ fromJson(inputs.data)['name'] || fromJson(inputs.data)['id'] }}"
+    uses: ./.github/workflows/a-wf-deploy-stack-packer-azure.yml
+    with:
+      data: ${{ inputs.data }}
+      env: ${{ inputs.env }}
+      external-repos: ${{ inputs.external-repos }}
+      actions-repository: ${{ inputs.actions-repository }}
+      actions-version: ${{ inputs.actions-version }}
+    secrets: inherit
 
-    - name: Checkout trusted actions
-      uses: actions/checkout@v7
-      with:
-        repository: GEBITSolutions/stax
-        ref: ${{ steps.resolve-actions-ref.outputs.sha }}
-        path: trusted-actions
-        clean: true
-        persist-credentials: false
-
-    - name: Prepare source checkout roots
-      shell: bash
-      run: |
-        set -euo pipefail
-        rm -rf -- "$GITHUB_WORKSPACE/source_repo" "$GITHUB_WORKSPACE/externalRepos"
-
-    - name: Determine source repository and token
-      id: source-repo
-      shell: bash
-      env:
-        DATA_JSON: ${{ inputs.data }}
-        EXTERNAL_REPOS_JSON: ${{ inputs.external-repos || '[]' }}
-        ALL_SECRETS_JSON: ${{ toJson(secrets) }}
-        APP_TOKEN: ${{ steps.app-token.outputs.token }}
-      run: |
-        set -euo pipefail
-        source_alias="$(jq -r '.source_repo // empty' <<< "$DATA_JSON")"
-        source_version="$(jq -r '.source_version // empty' <<< "$DATA_JSON")"
-
-        if [[ -n "$source_alias" ]]; then
-          repo="$(jq -cer --arg alias "$source_alias" '.[$alias][0]' <<< "$EXTERNAL_REPOS_JSON")"
-          repo_url="$(jq -r '.repoURL // empty' <<< "$repo")"
-          target_revision="$(jq -r '.targetRevision // empty' <<< "$repo")"
-          repo_ref="$(sed -E 's#.*github\.com[:/]([^/]+)/([^/.]+)(\.git)?$#\1/\2#' <<< "$repo_url")"
-          if [[ "$repo_ref" != */* || "$repo_ref" == "$repo_url" ]]; then
-            echo "::error::source_repo '$source_alias' does not contain a supported GitHub repository URL."
-            exit 1
-          fi
-          if [[ -z "$source_version" ]]; then
-            source_version="$target_revision"
-          fi
-          if [[ -z "$source_version" ]]; then
-            echo "::error::source_repo '$source_alias' requires source_version or targetRevision."
-            exit 1
-          fi
-
-          repo_org="${repo_ref%%/*}"
-          use_app_token="$(jq -r '.use_app_token // false' <<< "$repo")"
-          token_name="$(jq -r '.token // empty' <<< "$repo")"
-          token_value=""
-
-          if [[ "$use_app_token" == "true" && "$repo_org" == "$GITHUB_REPOSITORY_OWNER" ]]; then
-            token_value="$APP_TOKEN"
-          fi
-          if [[ -z "$token_value" && -n "$token_name" ]]; then
-            token_value="$(jq -r --arg token "$token_name" '.[$token] // empty' <<< "$ALL_SECRETS_JSON")"
-          fi
-
-          echo "stack-repository=$repo_ref" >> "$GITHUB_OUTPUT"
-          if [[ -n "$token_value" ]]; then
-            echo "stack-repository-token=$token_value" >> "$GITHUB_OUTPUT"
-          fi
-        fi
-
-        if [[ -n "$source_version" ]]; then
-          echo "stack-repository-version=$source_version" >> "$GITHUB_OUTPUT"
-        fi
-
-    - name: Checkout Source Repository
-      uses: actions/checkout@v7
-      with:
-        path: source_repo
-        repository: ${{ steps.source-repo.outputs.stack-repository || github.repository }}
-        ref: ${{ steps.source-repo.outputs.stack-repository-version || github.sha }}
-        token: ${{ steps.source-repo.outputs.stack-repository-token || github.token }}
-        clean: true
-        persist-credentials: false
-
-    - name: Record resolved source revision
-      shell: bash
-      run: |
-        set -euo pipefail
-        source_sha="$(git -C "$GITHUB_WORKSPACE/source_repo" rev-parse HEAD)"
-        # shellcheck disable=SC2016 # Backticks are literal Markdown delimiters.
-        printf '### Packer source\n\n- Resolved source SHA: `%s`\n' "$source_sha" >> "$GITHUB_STEP_SUMMARY"
-
-    - name: Checkout external repositories
-      shell: bash
-      env:
-        EXTERNAL_REPOS_JSON: ${{ inputs.external-repos || '[]' }}
-        ALL_SECRETS_JSON: ${{ toJson(secrets) }}
-        APP_TOKEN: ${{ steps.app-token.outputs.token }}
-        EXTERNAL_REPOS_ROOT: ${{ github.workspace }}/externalRepos
-      run: |
-        set -euo pipefail
-        rm -rf -- "$EXTERNAL_REPOS_ROOT"
-        mkdir -p -- "$EXTERNAL_REPOS_ROOT"
-        external_root="$(realpath -e -- "$EXTERNAL_REPOS_ROOT")"
-
-        while read -r repo; do
-          name="$(jq -r '.key' <<< "$repo")"
-          if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$name" == "." || "$name" == ".." ]]; then
-            echo "::error::External repository alias '$name' is not a safe single path component."
-            exit 1
-          fi
-          definition="$(jq -cer '.value[0]' <<< "$repo")"
-          repo_url="$(jq -r '.repoURL // empty' <<< "$definition")"
-          target_revision="$(jq -r '.targetRevision // empty' <<< "$definition")"
-          use_app_token="$(jq -r '.use_app_token // false' <<< "$definition")"
-          token_name="$(jq -r '.token // empty' <<< "$definition")"
-          repo_ref="$(sed -E 's#.*github\.com[:/]([^/]+)/([^/.]+)(\.git)?$#\1/\2#' <<< "$repo_url")"
-
-          if [[ -z "$name" || "$repo_ref" != */* || "$repo_ref" == "$repo_url" || -z "$target_revision" ]]; then
-            echo "::error::External repository '$name' has an invalid repoURL or targetRevision."
-            exit 1
-          fi
-
-          repo_org="${repo_ref%%/*}"
-          token_value=""
-          if [[ "$use_app_token" == "true" && "$repo_org" == "$GITHUB_REPOSITORY_OWNER" ]]; then
-            token_value="$APP_TOKEN"
-          fi
-          if [[ -z "$token_value" && -n "$token_name" ]]; then
-            token_value="$(jq -r --arg token "$token_name" '.[$token] // empty' <<< "$ALL_SECRETS_JSON")"
-          fi
-          destination="$(realpath -m -- "$external_root/$name")"
-          if [[ "$destination" != "$external_root"/* ]]; then
-            echo "::error::External repository destination escapes externalRepos."
-            exit 1
-          fi
-
-          mkdir -p -- "$destination"
-          git -C "$destination" init --quiet
-          if [[ -n "$token_value" ]]; then
-            basic_auth="$(printf 'x-access-token:%s' "$token_value" | base64 | tr -d '\n')"
-            GIT_CONFIG_COUNT=1 \
-              GIT_CONFIG_KEY_0=http.extraheader \
-              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic_auth" \
-              git -C "$destination" fetch --quiet --depth=1 --no-tags \
-                "https://github.com/${repo_ref}.git" "$target_revision"
-          else
-            git -C "$destination" fetch --quiet --depth=1 --no-tags \
-              "https://github.com/${repo_ref}.git" "$target_revision"
-          fi
-          git -C "$destination" checkout --quiet --detach FETCH_HEAD
-          canonical_destination="$(realpath -e -- "$destination")"
-          if [[ "$canonical_destination" != "$external_root"/* ]]; then
-            rm -rf -- "$destination"
-            echo "::error::External repository destination resolves outside externalRepos."
-            exit 1
-          fi
-          unset basic_auth token_value
-        done < <(jq -c 'if type == "object" then to_entries[] else empty end' <<< "$EXTERNAL_REPOS_JSON")
-
-    - name: Convert Inputs
-      id: convert-inputs
-      if: ${{ vars.REPO_KEYSTORE_KEY_VAULT_URL == '' }}
-      uses: ./trusted-actions/.github/actions/gh-convert-stack-inputs
-      with:
-        variables: ${{ toJson(vars) }}
-        secrets: ${{ toJson(secrets) }}
-        excluded-secrets: ${{ steps.preflight.outputs.excluded-secret-names }}
-        convertInputs: ${{ fromJson(inputs.data)['input'] && toJson(fromJson(inputs.data)['input']) || '[]' }}
-        config-globals: ${{ fromJson(inputs.data)['config_globals'] && toJson(fromJson(inputs.data)['config_globals']) ||
-          '{}' }}
-        pipeline-globals: ${{ inputs.env }}
-        allowNull: "false"
-
-    - name: Convert Inputs Key Vault (ARM SP)
-      id: convert-inputs-key-vault
-      if: ${{ vars.REPO_KEYSTORE_KEY_VAULT_URL != '' && vars.REPO_KEYSTORE_SP_CLIENT_ID == '' }}
-      uses: ./trusted-actions/.github/actions/gh-convert-stack-inputs
-      with:
-        variables: ${{ toJson(vars) }}
-        secrets: ${{ toJson(secrets) }}
-        excluded-secrets: ${{ steps.preflight.outputs.excluded-secret-names }}
-        convertInputs: ${{ fromJson(inputs.data)['input'] && toJson(fromJson(inputs.data)['input']) || '[]' }}
-        config-globals: ${{ fromJson(inputs.data)['config_globals'] && toJson(fromJson(inputs.data)['config_globals']) ||
-          '{}' }}
-        pipeline-globals: ${{ inputs.env }}
-        allowNull: "false"
-        environment-name: ${{ env.ENVIRONMENT }}
-        key-vault-url: ${{ vars.REPO_KEYSTORE_KEY_VAULT_URL }}
-        key-vault-sp-client-id: ${{ env.ARM_CLIENT_ID }}
-        key-vault-sp-client-secret: ${{ vars.OIDC_ENABLED != 'true' && secrets.ARM_CLIENT_SECRET || '' }}
-        key-vault-sp-tenant-id: ${{ env.ARM_TENANT_ID }}
-        oidc-enabled: ${{ vars.OIDC_ENABLED || 'false' }}
-
-    - name: Convert Inputs Key Vault (Keystore SP)
-      id: convert-inputs-key-vault-keystore
-      if: ${{ vars.REPO_KEYSTORE_KEY_VAULT_URL != '' && vars.REPO_KEYSTORE_SP_CLIENT_ID != '' }}
-      uses: ./trusted-actions/.github/actions/gh-convert-stack-inputs
-      with:
-        variables: ${{ toJson(vars) }}
-        secrets: ${{ toJson(secrets) }}
-        excluded-secrets: ${{ steps.preflight.outputs.excluded-secret-names }}
-        convertInputs: ${{ fromJson(inputs.data)['input'] && toJson(fromJson(inputs.data)['input']) || '[]' }}
-        config-globals: ${{ fromJson(inputs.data)['config_globals'] && toJson(fromJson(inputs.data)['config_globals']) ||
-          '{}' }}
-        pipeline-globals: ${{ inputs.env }}
-        allowNull: "false"
-        environment-name: ${{ env.ENVIRONMENT }}
-        key-vault-url: ${{ vars.REPO_KEYSTORE_KEY_VAULT_URL }}
-        key-vault-sp-client-id: ${{ vars.REPO_KEYSTORE_SP_CLIENT_ID }}
-        key-vault-sp-client-secret: ${{ vars.REPO_KEYSTORE_OIDC_ENABLED != 'true' && secrets.REPO_KEYSTORE_SP_CLIENT_SECRET
-          || '' }}
-        key-vault-sp-tenant-id: ${{ vars.REPO_KEYSTORE_SP_TENANT_ID }}
-        oidc-enabled: ${{ vars.REPO_KEYSTORE_OIDC_ENABLED || 'false' }}
-
-    - name: Install exact Packer version
-      shell: bash
-      env:
-        PACKER_VERSION: ${{ steps.preflight.outputs.packer-version }}
-      run: |
-        set -euo pipefail
-        if [[ "$RUNNER_OS" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
-          echo "::error::The current Packer download supports Linux x86_64 runners only."
-          exit 1
-        fi
-
-        archive_name="packer_${PACKER_VERSION}_linux_amd64.zip"
-        archive="${RUNNER_TEMP}/${archive_name}"
-        sums="${RUNNER_TEMP}/packer_${PACKER_VERSION}_SHA256SUMS"
-        install_dir="${RUNNER_TEMP}/packer-${PACKER_VERSION}"
-
-        curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-          --output "$archive" "https://releases.hashicorp.com/packer/${PACKER_VERSION}/${archive_name}"
-        curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-          --output "$sums" "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_SHA256SUMS"
-
-        expected="$(awk -v name="$archive_name" '$2 == name || $2 == "*" name {print $1}' "$sums")"
-        if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
-          echo "::error::HashiCorp checksum manifest did not contain exactly one valid checksum for $archive_name."
-          exit 1
-        fi
-        printf '%s  %s\n' "$expected" "$archive" | sha256sum --check --status
-
-        mkdir -p "$install_dir"
-        unzip -q "$archive" -d "$install_dir"
-        chmod 0755 "$install_dir/packer"
-        echo "$install_dir" >> "$GITHUB_PATH"
-        "$install_dir/packer" version > /dev/null
-        # shellcheck disable=SC2016 # Backticks are literal Markdown delimiters.
-        printf '\n- Packer version: `%s`\n' "$PACKER_VERSION" >> "$GITHUB_STEP_SUMMARY"
-
-    - name: Write private Packer variables
-      id: packer-vars
-      shell: bash
-      env:
-        CONVERTED_VARS: ${{ steps.convert-inputs-key-vault-keystore.outputs.tf-vars-map || steps.convert-inputs-key-vault.outputs.tf-vars-map
-          || steps.convert-inputs.outputs.tf-vars-map || '[]' }}
-      run: |
-        set -euo pipefail
-        umask 077
-        packer_vars_file="$(mktemp "${RUNNER_TEMP}/packer-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.XXXXXX.pkrvars.json")"
-
-        jq -e '
-          if type != "array" then
-            error("converted inputs must be an array")
-          else . end
-          | map(
-              if (.key | type) != "string" or (.key | length) == 0 or has("value") == false then
-                error("each converted input must contain a nonempty key and a value")
-              else
-                {original: .key, normalized: (.key | gsub("-"; "_")), value: .value}
-              end
-            )
-          | if any(.[]; (.normalized | test("^[A-Za-z_][A-Za-z0-9_]*$") | not)) then
-              error("converted input contains a key that is not a valid Packer variable name")
-            else . end
-          | group_by(.normalized)
-          | if any(.[]; length > 1) then
-              error("converted input keys collide after replacing hyphens with underscores")
-            else . end
-          | map(.[0] | {key: .normalized, value: .value})
-          | from_entries
-        ' <<< "$CONVERTED_VARS" > "$packer_vars_file"
-
-        chmod 0600 "$packer_vars_file"
-        echo "file=$packer_vars_file" >> "$GITHUB_OUTPUT"
-
-    - name: Resolve and validate Packer paths
-      id: packer-paths
-      shell: bash
-      env:
-        DATA_JSON: ${{ inputs.data }}
-      run: |
-        set -euo pipefail
-        source_root="$(realpath -e -- "$GITHUB_WORKSPACE/source_repo")"
-        packer_directory="$(jq -r '.packer_directory' <<< "$DATA_JSON")"
-        packer_template="$(jq -r '.packer_template // "."' <<< "$DATA_JSON")"
-        packer_dir="$(realpath -e -- "$source_root/$packer_directory")" || {
-          echo "::error::Packer directory does not exist."
-          exit 1
-        }
-
-        if [[ ! -d "$packer_dir" || "$packer_dir" != "$source_root" && "$packer_dir" != "$source_root"/* ]]; then
-          echo "::error::packer_directory resolves outside the checked-out source repository or is not a directory."
-          exit 1
-        fi
-
-        template_path="$(realpath -e "$packer_dir/$packer_template")" || {
-          echo "::error::Packer template does not exist."
-          exit 1
-        }
-        if [[ "$template_path" != "$packer_dir" && "$template_path" != "$packer_dir"/* ]]; then
-          echo "::error::packer_template resolves outside packer_directory."
-          exit 1
-        fi
-
-        echo "directory=$packer_dir" >> "$GITHUB_OUTPUT"
-        echo "template=$template_path" >> "$GITHUB_OUTPUT"
-
-    - name: Format and validate Packer template
-      shell: bash
-      env:
-        PACKER_DIRECTORY: ${{ steps.packer-paths.outputs.directory }}
-        PACKER_TEMPLATE: ${{ steps.packer-paths.outputs.template }}
-        PACKER_VARS_FILE: ${{ steps.packer-vars.outputs.file }}
-      run: |
-        set -euo pipefail
-        cd -- "$PACKER_DIRECTORY"
-        packer fmt -check "$PACKER_TEMPLATE"
-        packer init "$PACKER_TEMPLATE"
-        packer validate -var-file="$PACKER_VARS_FILE" "$PACKER_TEMPLATE"
-
-    - name: Validate Gallery publication inputs
-      if: ${{ steps.preflight.outputs.dry-run == 'false' }}
-      shell: bash
-      env:
-        PACKER_VARS_FILE: ${{ steps.packer-vars.outputs.file }}
-      run: |
-        set -euo pipefail
-        jq -e '
-          def nonempty_string: type == "string" and length > 0;
-          (.image_resource_group_name | nonempty_string) and
-          (.gallery_name | nonempty_string) and
-          (.image_definition_name | nonempty_string) and
-          (.image_version | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
-          (.target_regions | type == "array" and length > 0 and all(.[]; nonempty_string)) and
-          ((.target_regions | map(ascii_downcase | gsub("[[:space:]_-]"; "")) | unique | length) == (.target_regions | length))
-        ' "$PACKER_VARS_FILE" > /dev/null || {
-          echo "::error::A build requires image_resource_group_name, gallery_name, image_definition_name, numeric image_version, and a nonempty unique target_regions string array."
-          exit 1
-        }
-
-        resource_group="$(jq -r '.image_resource_group_name' "$PACKER_VARS_FILE")"
-        gallery="$(jq -r '.gallery_name' "$PACKER_VARS_FILE")"
-        definition="$(jq -r '.image_definition_name' "$PACKER_VARS_FILE")"
-        version="$(jq -r '.image_version' "$PACKER_VARS_FILE")"
-        regions="$(jq -r '.target_regions | join(", ")' "$PACKER_VARS_FILE")"
-        {
-          printf '\n### Azure Compute Gallery destination\n\n'
-          # shellcheck disable=SC2016 # Backticks are literal Markdown delimiters.
-          printf -- '- Resource group: `%s`\n' "$resource_group"
-          # shellcheck disable=SC2016 # Backticks are literal Markdown delimiters.
-          printf -- '- Gallery: `%s`\n' "$gallery"
-          # shellcheck disable=SC2016 # Backticks are literal Markdown delimiters.
-          printf -- '- Image definition: `%s`\n' "$definition"
-          # shellcheck disable=SC2016 # Backticks are literal Markdown delimiters.
-          printf -- '- Version: `%s`\n' "$version"
-          # shellcheck disable=SC2016 # Backticks are literal Markdown delimiters.
-          printf -- '- Target regions: `%s`\n' "$regions"
-        } >> "$GITHUB_STEP_SUMMARY"
-
-    - name: Azure login
-      if: ${{ steps.preflight.outputs.dry-run == 'false' }}
-      shell: bash
-      env:
-        ARM_CLIENT_SECRET: ${{ vars.OIDC_ENABLED != 'true' && secrets.ARM_CLIENT_SECRET || '' }}
-      run: |
-        set -euo pipefail
-        for value in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID; do
-          if [[ -z "${!value:-}" ]]; then
-            echo "::error::$value is required for a Packer build."
-            exit 1
-          fi
-        done
-
-        if [[ "$ARM_USE_OIDC" == "true" ]]; then
-          token="$(curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
-            --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | jq -er '.value')" || {
-            echo "::error::Azure OIDC token request failed."
-            exit 1
-          }
-          echo "::add-mask::$token"
-          az login --service-principal --username "$ARM_CLIENT_ID" --tenant "$ARM_TENANT_ID" \
-            --federated-token "$token" --output none
-          unset token
-        elif [[ "$ARM_USE_OIDC" == "false" ]]; then
-          if [[ -z "$ARM_CLIENT_SECRET" ]]; then
-            echo "::error::ARM_CLIENT_SECRET is required when OIDC is disabled."
-            exit 1
-          fi
-          az login --service-principal --username "$ARM_CLIENT_ID" --password "$ARM_CLIENT_SECRET" \
-            --tenant "$ARM_TENANT_ID" --output none
-        else
-          echo "::error::OIDC_ENABLED must be the literal true or false."
-          exit 1
-        fi
-        az account set --subscription "$ARM_SUBSCRIPTION_ID"
-
-    - name: Reject existing Gallery image version
-      if: ${{ steps.preflight.outputs.dry-run == 'false' }}
-      shell: bash
-      env:
-        PACKER_VARS_FILE: ${{ steps.packer-vars.outputs.file }}
-      run: |
-        set -euo pipefail
-        resource_group="$(jq -r '.image_resource_group_name' "$PACKER_VARS_FILE")"
-        gallery="$(jq -r '.gallery_name' "$PACKER_VARS_FILE")"
-        definition="$(jq -r '.image_definition_name' "$PACKER_VARS_FILE")"
-        version="$(jq -r '.image_version' "$PACKER_VARS_FILE")"
-
-        versions="$(az sig image-version list \
-          --resource-group "$resource_group" \
-          --gallery-name "$gallery" \
-          --gallery-image-definition "$definition" \
-          --only-show-errors --output json)" || {
-            echo "::error::Unable to list Gallery image versions; refusing to build."
-            exit 1
-          }
-        if ! jq -e 'type == "array" and all(.[]; type == "object" and (.name | type == "string"))' <<< "$versions" > /dev/null; then
-          echo "::error::Gallery image version list returned an invalid response; refusing to build."
-          exit 1
-        fi
-        if jq -e --arg version "$version" 'any(.[]; .name == $version)' <<< "$versions" > /dev/null; then
-          echo "::error::Gallery image version already exists; refusing to overwrite ${gallery}/${definition}/${version}."
-          exit 1
-        fi
-
-    - name: Build and wait for Gallery replication
-      id: publish
-      if: ${{ steps.preflight.outputs.dry-run == 'false' }}
-      shell: bash
-      env:
-        PACKER_DIRECTORY: ${{ steps.packer-paths.outputs.directory }}
-        PACKER_TEMPLATE: ${{ steps.packer-paths.outputs.template }}
-        PACKER_VARS_FILE: ${{ steps.packer-vars.outputs.file }}
-      run: |
-        set -euo pipefail
-        cd -- "$PACKER_DIRECTORY"
-        resource_group="$(jq -r '.image_resource_group_name' "$PACKER_VARS_FILE")"
-        gallery="$(jq -r '.gallery_name' "$PACKER_VARS_FILE")"
-        definition="$(jq -r '.image_definition_name' "$PACKER_VARS_FILE")"
-        version="$(jq -r '.image_version' "$PACKER_VARS_FILE")"
-        target_regions="$(jq -c '.target_regions' "$PACKER_VARS_FILE")"
-
-        packer build -var-file="$PACKER_VARS_FILE" "$PACKER_TEMPLATE"
-
-        az sig image-version wait \
-          --resource-group "$resource_group" \
-          --gallery-name "$gallery" \
-          --gallery-image-definition "$definition" \
-          --gallery-image-version "$version" \
-          --created --interval 30 --timeout 1800 --only-show-errors
-
-        ready="false"
-        image_id=""
-        for ((attempt = 1; attempt <= 60; attempt++)); do
-          status_json="$(az sig image-version show \
-            --resource-group "$resource_group" \
-            --gallery-name "$gallery" \
-            --gallery-image-definition "$definition" \
-            --gallery-image-version "$version" \
-            --expand ReplicationStatus \
-            --only-show-errors --output json)" || {
-              echo "::error::Unable to read Gallery image version readiness."
-              exit 1
-            }
-
-          provisioning_state="$(jq -r '.provisioningState // empty' <<< "$status_json")"
-          case "$provisioning_state" in
-            Failed|Canceled|Cancelled)
-              echo "::error::Gallery image version provisioning ended in state '$provisioning_state'."
-              exit 1
-              ;;
-          esac
-
-          regional_status="$(jq -c --argjson requested "$target_regions" '
-            def norm: ascii_downcase | gsub("[[:space:]_-]"; "");
-            (.replicationStatus.summary // []) as $summary
-            | [
-                $requested[] as $region
-                | ($summary | map(select((.region | norm) == ($region | norm)))) as $matches
-                | {
-                    region: $region,
-                    matches: ($matches | length),
-                    state: ($matches[0].state // "Missing")
-                  }
-              ]
-          ' <<< "$status_json")"
-
-          if jq -e 'any(.[]; .matches > 1 or .state == "Failed" or .state == "Canceled" or .state == "Cancelled")' \
-            <<< "$regional_status" > /dev/null; then
-            echo "::error::Gallery replication failed or returned ambiguous status for a requested region."
-            exit 1
-          fi
-
-          if [[ "$provisioning_state" == "Succeeded" ]] && \
-            jq -e 'all(.[]; .matches == 1 and .state == "Completed")' <<< "$regional_status" > /dev/null; then
-            image_id="$(jq -r '.id // empty' <<< "$status_json")"
-            ready="true"
-            break
-          fi
-
-          if [[ "$attempt" -lt 60 ]]; then
-            sleep 30
-          fi
-        done
-
-        if [[ "$ready" != "true" || -z "$image_id" || "$image_id" != /subscriptions/* || "$image_id" != */versions/"$version" ]]; then
-          echo "::error::Gallery image version did not reach provisioning and replication readiness within 30 minutes."
-          exit 1
-        fi
-
-        echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
-        # shellcheck disable=SC2016 # Backticks are literal Markdown delimiters.
-        printf '\n- Ready image version ID: `%s`\n' "$image_id" >> "$GITHUB_STEP_SUMMARY"
-
-
-    - name: Clean up Packer credentials and temporary files
-      if: ${{ always() }}
-      shell: bash
-      env:
-        PACKER_VARS_FILE: ${{ steps.packer-vars.outputs.file }}
-        PACKER_VERSION: ${{ steps.preflight.outputs.packer-version }}
-      run: |
-        set +e
-        if command -v az > /dev/null 2>&1; then
-          az logout > /dev/null 2>&1
-          az account clear > /dev/null 2>&1
-        fi
-        if [[ -n "$PACKER_VARS_FILE" ]]; then
-          rm -f -- "$PACKER_VARS_FILE"
-        fi
-        rm -f -- "$RUNNER_TEMP"/packer-*.pkrvars.json
-        rm -f -- "$RUNNER_TEMP"/packer_*.zip "$RUNNER_TEMP"/packer_*_SHA256SUMS
-        if [[ -n "$PACKER_VERSION" ]]; then
-          rm -rf -- "$RUNNER_TEMP/packer-$PACKER_VERSION"
-        fi
-        rm -rf -- "$GITHUB_WORKSPACE/trusted-actions" "$GITHUB_WORKSPACE/source_repo" "$GITHUB_WORKSPACE/externalRepos"
-
-  transfer:
-    name: "Transfer Packer output ${{ fromJson(inputs.data)['name'] || fromJson(inputs.data)['id'] }}"
-    needs: packer
-    if: ${{ needs.packer.result == 'success' && needs.packer.outputs.image_id != '' && needs.packer.outputs.transfer_requested
-      == 'true' }}
-    runs-on: ubuntu-latest
-    environment: ${{ fromJson(inputs.env)['environment'] || 'dev' }}
-    steps:
-    - name: Checkout trusted actions
-      uses: actions/checkout@v7
-      with:
-        repository: GEBITSolutions/stax
-        ref: ${{ needs.packer.outputs.actions_sha }}
-        path: trusted-actions
-        clean: true
-        persist-credentials: false
-
-    - name: Prepare requested output transfer
-      id: output-transfer
-      shell: bash
-      env:
-        DATA_JSON: ${{ inputs.data }}
-        IMAGE_ID: ${{ needs.packer.outputs.image_id }}
-      run: |
-        set -euo pipefail
-        stack_id="$(jq -er 'if (.id | type) == "string" then .id else error("id must be a string") end' <<< "$DATA_JSON" | tr '-' '_')"
-        if [[ ! "$stack_id" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-          echo "::error::Stack id cannot be converted to a valid output variable prefix."
-          exit 1
-        fi
-        transfer_variable_key="${stack_id^^}__IMAGE_ID"
-        variables="$(jq -cn --arg key "$transfer_variable_key" --arg value "$IMAGE_ID" '{($key): $value}')"
-        echo "variables=$variables" >> "$GITHUB_OUTPUT"
-
-    - name: Generate GitHub App Token for output transfer
-      id: app-token
-      if: ${{ vars.REPO_KEYSTORE_KEY_VAULT_URL == '' && (vars.RELEASE_APP_CLIENT_ID != '' || vars.RELEASE_GH_APP_ID != '') }}
-      continue-on-error: true
-      uses: actions/create-github-app-token@v3
-      with:
-        client-id: ${{ vars.RELEASE_APP_CLIENT_ID || vars.RELEASE_GH_APP_ID }}
-        private-key: ${{ secrets.RELEASE_APP_CLIENT_SECRET || secrets.RELEASE_GH_APP_PRIVATE_KEY }}
-        owner: ${{ github.repository_owner }}
-        repositories: ${{ github.event.repository.name }}
-        permission-environments: write
-
-    - name: Export image_id to Key Vault (Keystore SP)
-      if: ${{ vars.REPO_KEYSTORE_KEY_VAULT_URL != '' && vars.REPO_KEYSTORE_SP_CLIENT_ID != '' }}
-      uses: ./trusted-actions/.github/actions/gh-data-transfer/v2
-      with:
-        environment-name: ${{ fromJson(inputs.env)['environment'] || 'dev' }}
-        key-vault-url: ${{ vars.REPO_KEYSTORE_KEY_VAULT_URL }}
-        key-vault-sp-client-id: ${{ vars.REPO_KEYSTORE_SP_CLIENT_ID }}
-        key-vault-sp-client-secret: ${{ vars.REPO_KEYSTORE_OIDC_ENABLED != 'true' && secrets.REPO_KEYSTORE_SP_CLIENT_SECRET
-          || '' }}
-        key-vault-sp-tenant-id: ${{ vars.REPO_KEYSTORE_SP_TENANT_ID }}
-        variables: ${{ steps.output-transfer.outputs.variables }}
-
-    - name: Export image_id to Key Vault (ARM SP)
-      if: ${{ vars.REPO_KEYSTORE_KEY_VAULT_URL != '' && vars.REPO_KEYSTORE_SP_CLIENT_ID == '' }}
-      uses: ./trusted-actions/.github/actions/gh-data-transfer/v2
-      with:
-        environment-name: ${{ fromJson(inputs.env)['environment'] || 'dev' }}
-        key-vault-url: ${{ vars.REPO_KEYSTORE_KEY_VAULT_URL }}
-        key-vault-sp-client-id: ${{ vars.ARM_CLIENT_ID || secrets.ARM_CLIENT_ID }}
-        key-vault-sp-client-secret: ${{ vars.OIDC_ENABLED != 'true' && secrets.ARM_CLIENT_SECRET || '' }}
-        key-vault-sp-tenant-id: ${{ vars.ARM_TENANT_ID || secrets.ARM_TENANT_ID }}
-        variables: ${{ steps.output-transfer.outputs.variables }}
-
-    - name: Export image_id to GitHub Environment
-      if: ${{ vars.REPO_KEYSTORE_KEY_VAULT_URL == '' }}
-      uses: ./trusted-actions/.github/actions/gh-data-transfer/v2
-      with:
-        environment-name: ${{ fromJson(inputs.env)['environment'] || 'dev' }}
-        github-token: ${{ steps.app-token.outputs.token || secrets.CI_ENV_TRANSFER_GH_TOKEN }}
-        variables: ${{ steps.output-transfer.outputs.variables }}
+  hetzner:
+    needs: route
+    if: needs.route.outputs.build_target == 'hetzner'
+    name: "Packer Hetzner: ${{ fromJson(inputs.data)['name'] || fromJson(inputs.data)['id'] }}"
+    uses: ./.github/workflows/a-wf-deploy-stack-packer-hetzner.yml
+    with:
+      data: ${{ inputs.data }}
+      env: ${{ inputs.env }}
+      external-repos: ${{ inputs.external-repos }}
+      actions-repository: ${{ inputs.actions-repository }}
+      actions-version: ${{ inputs.actions-version }}
+    secrets: inherit

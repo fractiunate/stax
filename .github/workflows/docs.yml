@@ -19,6 +19,7 @@ on:
       - .github/scripts/docs-release-config*.mjs
       - .github/workflows/release.yml
       - .github/scripts/deployment-config*.mjs
+      - .github/scripts/state-backend*.mjs
   workflow_call:
     inputs:
       dry-run:
@@ -74,7 +75,7 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: .github/actions/gh-create-deploy-config/package-lock.json
-      - run: node --test .github/scripts/deployment-config.test.mjs .github/scripts/github-pages-config.test.mjs .github/scripts/docs-release-config.test.mjs
+      - run: node --test .github/scripts/deployment-config.test.mjs .github/scripts/state-backend.test.mjs .github/scripts/github-pages-config.test.mjs .github/scripts/docs-release-config.test.mjs
       - run: npm ci
         working-directory: .github/actions/gh-create-deploy-config
       - run: npm test -- --runInBand

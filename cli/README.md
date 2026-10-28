@@ -77,7 +77,7 @@ stax validate config other-dir -r --strict
 | Invalid YAML; wrong field types (e.g. `local_backend: "false"` instead of a boolean) | Fields the schema does not know (often typos such as `depend_on`) |
 | Missing `id` or `type`; unknown `type`; more than one `github-pages-site-deploy` stack or `destroy` on it | `depends_on` or `stack.<id>.var.<key>` pointing to a stack in another config |
 | Type-specific required fields: `folder` for `terraform`/`opentofu`/`function-build-deploy`, Packer `packer_directory`/`packer_version`, `s3-site-deploy` `location`, `script` `script`, `bizep` `template`, `function-build-deploy` `runtime` | `source_repo` alias not defined in this file (configs deployed together share `externalRepos`) |
-| Packer paths that are absolute, contain `..`, backslashes, empty segments or control characters; non-exact `packer_version` | No stacks defined |
+| Packer paths that are absolute, contain `..`, backslashes, empty segments or control characters; non-exact `packer_version`; `build_target: hetzner` without `hetzner` | No stacks defined; deprecated Gallery aliases (`gallery_name` and the other top-level Gallery fields); `build_target: aws` (reserved, the workflow rejects it) |
 | Duplicate stack ids; malformed `stack.<id>.var.<key>` references | |
 | Dependency cycles (including through `stack.<id>...` inputs); dependency chains deeper than 14 levels | |
 

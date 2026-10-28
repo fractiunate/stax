@@ -20,7 +20,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: stax-e2e-deploy
+  group: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && format('stax-e2e-fork-{0}', github.event.pull_request.number) || 'stax-e2e-deploy' }}
   cancel-in-progress: false
 
 env:
@@ -28,8 +28,43 @@ env:
   STORED_VARIABLES: E2E_TOFU__MESSAGE E2E_CONSUMER__DERIVED
 
 jobs:
+  fork-verify:
+    name: Verify trusted deploy acceptance
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    timeout-minutes: 12
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        sparse-checkout: .github/scripts
+        persist-credentials: false
+    - uses: actions/github-script@v8
+      with:
+        script: |
+          const { pathToFileURL } = await import('node:url');
+          const { trustedDeployRun } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/e2e-trusted-run.mjs`).href);
+          const sha = context.payload.pull_request.head.sha;
+          for (let attempt = 0; attempt < 60; attempt++) {
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              ...context.repo, workflow_id: 'e2e-deploy.yml', event: 'workflow_dispatch', head_sha: sha, per_page: 100,
+            });
+            const run = trustedDeployRun(runs, process.env.GITHUB_REPOSITORY, sha);
+            if (run?.status === 'completed') {
+              if (run.conclusion !== 'success') throw new Error(`Trusted deploy failed: ${run.html_url}`);
+              core.info(`Exact-commit deploy acceptance passed: ${run.html_url}`);
+              return;
+            }
+            core.info(`Awaiting maintainer-dispatched e2e-deploy.yml acceptance for ${sha}`);
+            await new Promise(resolve => setTimeout(resolve, 10000));
+          }
+          throw new Error('No successful upstream deploy acceptance for this PR head. A maintainer must dispatch e2e-deploy.yml on a reviewed upstream branch at the exact head SHA.');
+
   reset:
     name: Delete stored outputs
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
@@ -151,7 +186,7 @@ jobs:
   cleanup:
     name: Delete stored outputs
     needs: [reset, setup, apply, verify, destroy-setup, destroy, check-destroy]
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
@@ -172,7 +207,7 @@ jobs:
 
   result:
     name: "E2E: Deploy and destroy"
-    needs: [reset, setup, apply, verify, destroy-setup, destroy, check-destroy, cleanup]
+    needs: [fork-verify, reset, setup, apply, verify, destroy-setup, destroy, check-destroy, cleanup]
     if: always()
     runs-on: ubuntu-latest
     permissions: {}
@@ -180,6 +215,7 @@ jobs:
     - name: All jobs succeeded
       env:
         RESULTS: ${{ toJSON(needs) }}
+        FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
       run: |
         jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"${RESULTS}"
-        jq -e 'all(.[]; .result == "success")' <<<"${RESULTS}" >/dev/null
+        jq -e --arg fork "${FORK_PR}" 'if $fork == "true" then .["fork-verify"].result == "success" else all(to_entries[] | select(.key != "fork-verify"); .value.result == "success") end' <<<"${RESULTS}" >/dev/null

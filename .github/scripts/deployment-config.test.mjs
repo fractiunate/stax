@@ -37,6 +37,14 @@ test('exports all deployment fields as strings, normalizing cloud and Azure stor
     STATE_RESOURCE_GROUP_NAME: 'rg-state',
     STATE_BUCKET_NAME: '',
     STATE_REGION: '',
+    AWS_ENDPOINT_URL: '',
+    AWS_ENDPOINT_URL_S3: '',
+    AWS_ENDPOINT_URL_STS: '',
+    AWS_ENDPOINT_URL_IAM: '',
+    AWS_S3_COMPATIBLE: '',
+    AWS_SKIP_STS_CHECK: '',
+    STATE_USE_LOCKFILE: '',
+    STATE_USE_PATH_STYLE: '',
   });
 });
 
@@ -126,4 +134,98 @@ test('enforces normalized Azure account length without truncating or deriving a 
   assert.throws(() => resolve({ ...azure, state_storage_account_name: '---' }, { skipCloudValidation: true }), /STATE_STORAGE_ACCOUNT_NAME.*3-24/);
   assert.equal(resolve({ ...azure, state_storage_account_name: 'A'.repeat(24) }).STATE_STORAGE_ACCOUNT_NAME, 'a'.repeat(24));
   assert.equal(resolve({ ...azure, state_storage_account_name: 'A-2c!' }).STATE_STORAGE_ACCOUNT_NAME, 'a2c');
+});
+
+const awsBase = { project: 'docs', customer_id: 'acme', stage: 'prod', public_cloud_flag: false, cloud: 'aws', default_location: 'eu-central-2', state_bucket_name: 'tfstate', state_region: 'eu-central-2' };
+
+test('resolves S3-compatible endpoint options from config and GitHub variables', () => {
+  const context = resolveDeploymentContext({
+    documents: [{
+      sourceFile: 'configs/wasabi.yaml',
+      deployment: {
+        ...awsBase,
+        aws_endpoint_url_s3: 'https://s3.eu-central-2.wasabisys.com',
+        aws_s3_compatible: true,
+        state_use_lockfile: false,
+      },
+    }],
+    variables: { AWS_ENDPOINT_URL_STS: 'https://sts.wasabisys.com', STATE_USE_PATH_STYLE: 'true', AWS_SKIP_STS_CHECK: 'false' },
+  });
+  assert.equal(context.AWS_ENDPOINT_URL_S3, 'https://s3.eu-central-2.wasabisys.com');
+  assert.equal(context.AWS_ENDPOINT_URL_STS, 'https://sts.wasabisys.com');
+  assert.equal(context.AWS_ENDPOINT_URL, '');
+  assert.equal(context.AWS_S3_COMPATIBLE, 'true');
+  assert.equal(context.STATE_USE_LOCKFILE, 'false');
+  assert.equal(context.STATE_USE_PATH_STYLE, 'true');
+  assert.equal(context.AWS_SKIP_STS_CHECK, 'false');
+});
+
+test('accepts plain http only for local endpoints', () => {
+  for (const url of ['http://localhost:9000', 'http://127.0.0.1:9000/', 'https://minio.internal.example:9000']) {
+    assert.equal(resolve({ ...awsBase, aws_endpoint_url: url }).AWS_ENDPOINT_URL, url);
+  }
+});
+
+test('rejects invalid authorities and URL forms before exporting endpoints', () => {
+  for (const url of ['https://', 'https://s3.example.com:invalid', 'https://s3.example.com:99999', 'https://s3.example.com/path@user', 'https://s3.example.com\\evil', 'http://LOCALHOST:9000']) {
+    assert.throws(() => resolve({ ...awsBase, aws_endpoint_url_s3: url }), /aws_endpoint_url_s3/, url);
+  }
+});
+
+test('rejects unsafe or malformed endpoint URLs', () => {
+  for (const [url, message] of [
+    ['s3.wasabisys.com', /absolute URL/],
+    ['http://s3.wasabisys.com', /must use https/],
+    ['ftp://localhost', /must use https/],
+    ['https://key:secret@s3.wasabisys.com', /must not contain credentials/],
+    ['https://s3.wasabisys.com/?x=1', /query string/],
+  ]) {
+    assert.throws(() => resolve({ ...awsBase, aws_endpoint_url_s3: url }), message, url);
+  }
+  assert.throws(
+    () => resolveDeploymentContext({ documents: [{ deployment: awsBase }], variables: { AWS_ENDPOINT_URL_IAM: 'https://u:p@iam.wasabisys.com' } }),
+    /GitHub variable AWS_ENDPOINT_URL_IAM.*credentials/,
+  );
+});
+
+test('rejects non-boolean S3 compatibility flags', () => {
+  for (const field of ['aws_s3_compatible', 'aws_skip_sts_check', 'state_use_lockfile', 'state_use_path_style']) {
+    assert.throws(() => resolve({ ...awsBase, [field]: 'yes' }), new RegExp(`${field} must be a boolean`));
+  }
+});
+
+test('rejects AWS endpoint options for non-AWS clouds unless they keep the default', () => {
+  assert.throws(() => resolve({ ...azure, aws_endpoint_url_s3: 'https://s3.example.com' }), /aws_endpoint_url_s3 require cloud 'aws'/);
+  assert.throws(() => resolve({ ...azure, state_use_lockfile: false }), /state_use_lockfile require cloud 'aws'/);
+  assert.equal(resolve({ ...azure, state_use_lockfile: true, aws_s3_compatible: false }).CLOUD, 'azure');
+  assert.equal(resolve({ ...azure, aws_endpoint_url_s3: 'https://s3.example.com' }, { skipCloudValidation: true }).AWS_ENDPOINT_URL_S3, 'https://s3.example.com');
+});
+
+test('state profile requires only backend coordinates, with an optional Azure container', () => {
+  const stateOnly = { cloud: 'azure', default_location: 'northeurope', state_resource_group_name: 'rg-state', state_storage_account_name: 'stexamplestate' };
+  const state = resolve(stateOnly, { profile: 'state' });
+  assert.equal(state.STATE_STORAGE_ACCOUNT_NAME, 'stexamplestate');
+  assert.equal(state.STATE_CONTAINER_NAME, '');
+  assert.equal(state.PROJECT, '');
+  assert.equal(resolve({ ...stateOnly, state_container_name: 'widget-tfstate' }, { profile: 'state' }).STATE_CONTAINER_NAME, 'widget-tfstate');
+  // The deploy profile still rejects a state-only config.
+  assert.throws(() => resolve(stateOnly), /deployment\.project/);
+  for (const field of ['cloud', 'default_location', 'state_resource_group_name', 'state_storage_account_name']) {
+    assert.throws(() => resolve({ ...stateOnly, [field]: '' }, { profile: 'state' }), new RegExp(`deployment\\.${field}.*GitHub variable ${field.toUpperCase()}`));
+  }
+  // Skipping credential checks never relaxes backend requirements for state configs.
+  assert.throws(() => resolve({ ...stateOnly, state_resource_group_name: '' }, { profile: 'state', skipCloudValidation: true }), /state_resource_group_name/);
+  assert.throws(() => resolve({ ...stateOnly, state_storage_account_name: 'a'.repeat(25) }, { profile: 'state' }), /3-24/);
+
+  const aws = { cloud: 'aws', state_bucket_name: 'example-state', state_region: 'eu-west-1' };
+  assert.equal(resolve(aws, { profile: 'state' }).STATE_BUCKET_NAME, 'example-state');
+  assert.equal(resolve({ ...aws, state_region: '', default_location: 'eu-central-1' }, { profile: 'state' }).DEFAULT_LOCATION, 'eu-central-1');
+  assert.throws(() => resolve({ ...aws, state_region: '' }, { profile: 'state' }), /state_region.*default_location/);
+  assert.throws(() => resolve({ ...aws, state_bucket_name: '' }, { profile: 'state' }), /state_bucket_name/);
+  assert.throws(() => resolve(stateOnly, { profile: 'plan' }), /profile must be 'deploy' or 'state'/);
+  assert.throws(
+    () => resolveDeploymentContext({ documents: [{ sourceFile: 'configs/state.yaml', deployment: stateOnly, stacks: [{ id: 'app' }] }], profile: 'state' }),
+    /configs\/state\.yaml: state configs must not define stacks/,
+  );
+  assert.equal(resolveDeploymentContext({ documents: [{ deployment: stateOnly, stacks: [] }], profile: 'state' }).STATE_RESOURCE_GROUP_NAME, 'rg-state');
 });

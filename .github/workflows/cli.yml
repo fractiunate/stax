@@ -7,6 +7,12 @@ on:
       - cli/**
       - schema/**
       - configs/**
+      - examples/packer/**
+      - .github/scripts/packer-build-target.mjs
+      - .github/scripts/packer-build-target.test.mjs
+      - .github/workflows/a-wf-deploy-stack-packer.yml
+      - .github/workflows/a-wf-deploy-stack-packer-azure.yml
+      - .github/workflows/a-wf-deploy-stack-packer-hetzner.yml
       - .github/workflows/cli.yml
       - .github/workflows/cli-pack.yml
 
@@ -29,6 +35,9 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: Test Packer build-target contract
+        run: node --test ../.github/scripts/packer-build-target.test.mjs
+        working-directory: cli
       - run: npm run build
       - name: Smoke packed CLI global and project-local installs
         env:

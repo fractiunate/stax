@@ -1,0 +1,152 @@
+---
+name: ".Deploy State Backend (Abstract)"
+
+# Deploys the Terraform/OpenTofu state backend described by a state config. Call
+# a-wf-setup-ci.yml with config-profile: state first and pass its outputs here:
+#
+#   setup:  uses: GEBITSolutions/stax/.github/workflows/a-wf-setup-ci.yml@1.5.0
+#           with: { config-profile: state, release_config_filepath: configs/state/<name>.yaml, ... }
+#   state:  uses: GEBITSolutions/stax/.github/workflows/a-wf-deploy-state.yml@1.5.0
+#           with: { env: needs.setup.outputs.env, default_location: needs.setup.outputs.default-location }
+#
+# Azure: resource group, storage account and (when state_container_name is set) a private
+# container. AWS: S3 bucket. setup's dry-run (default true) only plans; destroy is rejected.
+# Cloud credentials and the GitHub Environment belong to the caller.
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        required: true
+        type: string
+        description: "env output of a-wf-setup-ci.yml (config-profile: state)"
+      default_location:
+        required: false
+        type: string
+        default: ""
+        description: "default-location output of a-wf-setup-ci.yml (Azure location, AWS region fallback)"
+      runs-on:
+        required: false
+        type: string
+        default: "ubuntu-22.04"
+      actions-repository:
+        required: false
+        type: string
+        default: "GEBITSolutions/stax"
+        description: "Github Repo for shared actions."
+      actions-version:
+        required: false
+        type: string
+        default: "1.5.0"
+        description: "Github ref (branch/tag/sha) for shared actions."
+    outputs:
+      cloud:
+        value: ${{ jobs.plan.outputs.cloud }}
+      dry-run:
+        value: ${{ jobs.plan.outputs.dry-run }}
+      resource-group-name:
+        value: ${{ jobs.plan.outputs.resource-group-name }}
+      storage-account-name:
+        value: ${{ jobs.plan.outputs.storage-account-name }}
+      container-name:
+        value: ${{ jobs.plan.outputs.container-name }}
+      location:
+        value: ${{ jobs.plan.outputs.location }}
+      bucket-name:
+        value: ${{ jobs.plan.outputs.bucket-name }}
+      region:
+        value: ${{ jobs.plan.outputs.region }}
+    secrets:
+      ARM_CLIENT_ID:
+        required: false
+      ARM_CLIENT_SECRET:
+        required: false
+      ARM_TENANT_ID:
+        required: false
+      ARM_SUBSCRIPTION_ID:
+        required: false
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      AWS_SESSION_TOKEN:
+        required: false
+      AWS_ROLE_ARN:
+        required: false
+
+jobs:
+  plan:
+    name: "Plan State Backend"
+    runs-on: ${{ inputs.runs-on || 'ubuntu-22.04' }}
+    permissions:
+      contents: read
+    outputs:
+      cloud: ${{ steps.plan.outputs.cloud }}
+      dry-run: ${{ steps.plan.outputs.dry_run }}
+      resource-group-name: ${{ steps.plan.outputs.resource_group_name }}
+      storage-account-name: ${{ steps.plan.outputs.storage_account_name }}
+      container-name: ${{ steps.plan.outputs.container_name }}
+      location: ${{ steps.plan.outputs.location }}
+      bucket-name: ${{ steps.plan.outputs.bucket_name }}
+      region: ${{ steps.plan.outputs.region }}
+    steps:
+    - name: Checkout Shared Code Scripts
+      uses: actions/checkout@v7
+      with:
+        repository: ${{ inputs.actions-repository || 'GEBITSolutions/stax' }}
+        ref: ${{ inputs.actions-version || 'main' }}
+        path: _shared_actions
+        sparse-checkout: .github/scripts
+        persist-credentials: false
+
+    - name: Plan
+      id: plan
+      uses: actions/github-script@v8
+      env:
+        SETUP_ENV: ${{ inputs.env }}
+        DEFAULT_LOCATION: ${{ inputs.default_location }}
+      with:
+        script: |
+          const { pathToFileURL } = await import('node:url');
+          const { planStateBackend } = await import(pathToFileURL(
+            `${process.env.GITHUB_WORKSPACE}/_shared_actions/.github/scripts/state-backend.mjs`
+          ).href);
+          const plan = planStateBackend({
+            env: JSON.parse(process.env.SETUP_ENV),
+            defaultLocation: process.env.DEFAULT_LOCATION,
+          });
+          for (const [name, value] of Object.entries(plan)) core.setOutput(name, value);
+
+          const rows = plan.cloud === 'azure'
+            ? [['Resource group', plan.resource_group_name], ['Storage account', plan.storage_account_name],
+               ['Container', plan.container_name || '(none, account only)'], ['Location', plan.location]]
+            : [['S3 bucket', plan.bucket_name], ['Region', plan.region]];
+          await core.summary
+            .addHeading(`State backend (${plan.cloud})${plan.dry_run === 'true' ? ': dry run, nothing deployed' : ''}`, 2)
+            .addTable([[{ data: 'Resource', header: true }, { data: 'Name', header: true }], ...rows])
+            .write();
+
+  provision:
+    name: "Provision"
+    needs: plan
+    if: needs.plan.outputs.dry-run == 'false'
+    # Inherits the caller's permissions: deploying callers grant id-token: write for OIDC.
+    # Requesting it here would fail at startup for plan-only callers that grant less.
+    uses: ./.github/workflows/a-wf-setup-state.yaml
+    secrets: inherit
+    with:
+      environment: ${{ fromJSON(inputs.env).environment }}
+      cloud: ${{ needs.plan.outputs.cloud }}
+      resource_group_name: ${{ needs.plan.outputs.resource-group-name }}
+      storage_account_name: ${{ needs.plan.outputs.storage-account-name }}
+      container_name: ${{ needs.plan.outputs.container-name }}
+      create-container: ${{ needs.plan.outputs.container-name != '' }}
+      location: ${{ needs.plan.outputs.location }}
+      bucket_name: ${{ needs.plan.outputs.bucket-name }}
+      region: ${{ needs.plan.outputs.region }}
+      # S3-compatible stores: setup resolves and validates these deployment fields.
+      aws_endpoint_url: ${{ fromJSON(inputs.env).aws_endpoint_url || '' }}
+      aws_endpoint_url_s3: ${{ fromJSON(inputs.env).aws_endpoint_url_s3 || '' }}
+      aws_endpoint_url_sts: ${{ fromJSON(inputs.env).aws_endpoint_url_sts || '' }}
+      aws_s3_compatible: ${{ fromJSON(inputs.env).aws_s3_compatible || '' }}
+      aws_skip_sts_check: ${{ fromJSON(inputs.env).aws_skip_sts_check || '' }}

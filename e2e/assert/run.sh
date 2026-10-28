@@ -13,7 +13,7 @@ repo="repos/${GITHUB_REPOSITORY}"
 run="${repo}/actions/runs/${GITHUB_RUN_ID}"
 
 jobs_json() {
-  gh api --paginate "${run}/attempts/${GITHUB_RUN_ATTEMPT}/jobs" --jq '.jobs[] | {name, conclusion}' | jq -s .
+  gh api --paginate "${run}/attempts/${GITHUB_RUN_ATTEMPT}/jobs" --jq '.jobs[] | {id, name, conclusion}' | jq -s .
 }
 
 fail() {
@@ -26,10 +26,22 @@ shift
 case "${command}" in
   jobs)
     pattern="$1" conclusion="$2" expected="$3"
-    all="$(jobs_json)"
+    # Dependencies have finished, but the list endpoint can retain stale job
+    # conclusions. Refresh matching pending jobs through their individual endpoint.
+    for attempt in {1..13}; do
+      all="$(jobs_json)"
+      while read -r job_id; do
+        job="$(gh api "${repo}/actions/jobs/${job_id}" --jq '{id, name, conclusion}')"
+        all="$(jq --argjson job "${job}" 'map(if .id == $job.id then $job else . end)' <<<"${all}")"
+      done < <(jq -r --arg pattern "${pattern}" '.[] | select((.name | test($pattern)) and .conclusion == null) | .id' <<<"${all}")
+      pending="$(jq --arg pattern "${pattern}" '[.[] | select((.name | test($pattern)) and .conclusion == null)] | length' <<<"${all}")"
+      if [[ "${pending}" == 0 || "${attempt}" == 13 ]]; then break; fi
+      echo "Waiting for final Jobs API conclusions matching '${pattern}' (${pending} pending)"
+      sleep 5
+    done
     count="$(jq --arg pattern "${pattern}" --arg conclusion "${conclusion}" \
       '[.[] | select((.name | test($pattern)) and .conclusion == $conclusion)] | length' <<<"${all}")"
-    if [[ "${count}" != "${expected}" ]]; then
+    if [[ "${count}" != "${expected}" || "${pending}" != 0 ]]; then
       jq -r '.[] | "\(.conclusion // "running")\t\(.name)"' <<<"${all}"
       fail "expected ${expected} job(s) matching '${pattern}' with conclusion ${conclusion}, found ${count}"
     fi

@@ -3,7 +3,9 @@ name: "E2E: Config resolution"
 
 # Resolves two deploy config files through a-wf-setup-ci.yml (setup only, nothing is
 # deployed) and checks deployment value precedence, per-file globals, explicit and
-# implicit dependencies across files, stack filters and if conditions. See e2e/README.md.
+# implicit dependencies across files, stack filters and if conditions. It also resolves
+# Azure and AWS state configs (config-profile: state) and dry-runs a-wf-deploy-state.yml.
+# See e2e/README.md.
 
 on:
   pull_request:
@@ -53,9 +55,55 @@ jobs:
       actions-repository: ${{ github.repository }}
       actions-version: ${{ github.sha }}
 
+  state-azure-setup:
+    name: State config (Azure)
+    uses: ./.github/workflows/a-wf-setup-ci.yml
+    with:
+      environment: e2e
+      stack_filter: ""
+      config-profile: state
+      release_config_filepath: e2e/configs/state-azure.yaml
+      skip-azure-credentials-validation: true
+      artifact_prefix: e2e-state-azure
+      actions-repository: ${{ github.repository }}
+      actions-version: ${{ github.sha }}
+
+  state-azure:
+    name: State backend dry run (Azure)
+    needs: state-azure-setup
+    uses: ./.github/workflows/a-wf-deploy-state.yml
+    with:
+      env: ${{ needs.state-azure-setup.outputs.env }}
+      default_location: ${{ needs.state-azure-setup.outputs.default-location }}
+      actions-repository: ${{ github.repository }}
+      actions-version: ${{ github.sha }}
+
+  state-aws-setup:
+    name: State config (AWS)
+    uses: ./.github/workflows/a-wf-setup-ci.yml
+    with:
+      environment: e2e
+      stack_filter: ""
+      config-profile: state
+      release_config_filepath: e2e/configs/state-aws.yaml
+      skip-azure-credentials-validation: true
+      artifact_prefix: e2e-state-aws
+      actions-repository: ${{ github.repository }}
+      actions-version: ${{ github.sha }}
+
+  state-aws:
+    name: State backend dry run (AWS)
+    needs: state-aws-setup
+    uses: ./.github/workflows/a-wf-deploy-state.yml
+    with:
+      env: ${{ needs.state-aws-setup.outputs.env }}
+      default_location: ${{ needs.state-aws-setup.outputs.default-location }}
+      actions-repository: ${{ github.repository }}
+      actions-version: ${{ github.sha }}
+
   check:
     name: Check resolved configs
-    needs: [all, group, upstream]
+    needs: [all, group, upstream, state-azure, state-aws]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
@@ -77,10 +125,14 @@ jobs:
         RUN_UPSTREAM_CONFIG: ${{ needs.upstream.outputs.ci-config }}
         RUN_UPSTREAM_ENV: ${{ needs.upstream.outputs.env }}
         RUN_UPSTREAM_LOCATION: ${{ needs.upstream.outputs.default-location }}
+    - run: node e2e/assert/state.mjs
+      env:
+        RUN_AZURE_PLAN: ${{ toJSON(needs.state-azure.outputs) }}
+        RUN_AWS_PLAN: ${{ toJSON(needs.state-aws.outputs) }}
 
   result:
     name: "E2E: Config resolution"
-    needs: [all, group, upstream, check]
+    needs: [all, group, upstream, state-azure-setup, state-azure, state-aws-setup, state-aws, check]
     if: always()
     runs-on: ubuntu-latest
     permissions: {}

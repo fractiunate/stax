@@ -35,6 +35,11 @@ on:
         required: false
         type: string
         default: "deploy-config-default.yaml"
+      config-profile:
+        required: false
+        type: string
+        default: "deploy"
+        description: "deploy: validate stack deployments. state: validate a state-backend config for a-wf-deploy-state.yml."
       is-ghe:
         required: false
         type: string
@@ -56,7 +61,7 @@ on:
       actions-version:
         required: false
         type: string
-        default: "1.3.3"
+        default: "1.5.0"
         description: "Github ref (branch/tag/sha) for shared actions."
     outputs:
       default-location:
@@ -316,6 +321,7 @@ jobs:
         DEPLOY_CONFIG_DOCUMENTS: ${{ steps.read-deploy-config.outputs.deploy-configs }}
         DEPLOYMENT_VARIABLES: ${{ toJSON(vars) }}
         SKIP_CLOUD_VALIDATION: ${{ inputs.skip-azure-credentials-validation }}
+        CONFIG_PROFILE: ${{ inputs.config-profile || 'deploy' }}
       with:
         script: |
           const { pathToFileURL } = await import('node:url');
@@ -326,8 +332,12 @@ jobs:
             documents: JSON.parse(process.env.DEPLOY_CONFIG_DOCUMENTS),
             variables: JSON.parse(process.env.DEPLOYMENT_VARIABLES),
             skipCloudValidation: process.env.SKIP_CLOUD_VALIDATION === 'true',
+            profile: process.env.CONFIG_PROFILE,
           });
-          for (const [name, value] of Object.entries(resolved)) core.exportVariable(name, value);
+          for (const [name, value] of Object.entries(resolved)) {
+            // AWS_ENDPOINT_URL* would redirect every later AWS CLI/SDK call in this job; keep them prefixed.
+            core.exportVariable(name.startsWith('AWS_ENDPOINT_URL') ? `DEPLOYMENT_${name}` : name, value);
+          }
           core.setOutput('default-location', resolved.DEFAULT_LOCATION);
 
     - name: Validate Environment
@@ -355,6 +365,14 @@ jobs:
           }
           if (missing_secrets.length > 0) {
             core.setFailed(`Required environment secrets are missing: ${missing_secrets.join(', ')}`);
+          }
+
+          // OIDC exchanges a GitHub token (audience sts.amazonaws.com) at AWS STS; S3-compatible stores do not offer that.
+          if (cloud === 'aws' && oidcEnabled && (env.DEPLOYMENT_AWS_ENDPOINT_URL || env.DEPLOYMENT_AWS_ENDPOINT_URL_STS)) {
+            core.setFailed('OIDC_ENABLED cannot be combined with aws_endpoint_url / aws_endpoint_url_sts. Use static AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY secrets for S3-compatible endpoints.');
+          }
+          if (cloud === 'aws' && env.STATE_USE_LOCKFILE === 'false') {
+            core.warning('state_use_lockfile is false: Terraform state is not locked, so concurrent deployments of a stack can corrupt its state.');
           }
 
     - name: Eval Branch or Tag Name
@@ -430,6 +448,14 @@ jobs:
           --arg cloud "$CLOUD" \
           --arg state_bucket_name "$STATE_BUCKET_NAME" \
           --arg state_region "$STATE_REGION" \
+          --arg aws_endpoint_url "$DEPLOYMENT_AWS_ENDPOINT_URL" \
+          --arg aws_endpoint_url_s3 "$DEPLOYMENT_AWS_ENDPOINT_URL_S3" \
+          --arg aws_endpoint_url_sts "$DEPLOYMENT_AWS_ENDPOINT_URL_STS" \
+          --arg aws_endpoint_url_iam "$DEPLOYMENT_AWS_ENDPOINT_URL_IAM" \
+          --arg aws_s3_compatible "$AWS_S3_COMPATIBLE" \
+          --arg aws_skip_sts_check "$AWS_SKIP_STS_CHECK" \
+          --arg state_use_lockfile "$STATE_USE_LOCKFILE" \
+          --arg state_use_path_style "$STATE_USE_PATH_STYLE" \
           '{
             customer_id: $customer_id,
             stage: $stage,
@@ -450,7 +476,15 @@ jobs:
             has_release_tag: $has_release_tag,
             cloud: $cloud,
             state_bucket_name: $state_bucket_name,
-            state_region: $state_region
+            state_region: $state_region,
+            aws_endpoint_url: $aws_endpoint_url,
+            aws_endpoint_url_s3: $aws_endpoint_url_s3,
+            aws_endpoint_url_sts: $aws_endpoint_url_sts,
+            aws_endpoint_url_iam: $aws_endpoint_url_iam,
+            aws_s3_compatible: $aws_s3_compatible,
+            aws_skip_sts_check: $aws_skip_sts_check,
+            state_use_lockfile: $state_use_lockfile,
+            state_use_path_style: $state_use_path_style
           }')
         echo "global-vars=$global_vars" >> "$GITHUB_OUTPUT"
 

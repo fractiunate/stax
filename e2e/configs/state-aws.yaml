@@ -1,0 +1,7 @@
+---
+# AWS state-backend config used by e2e-config.yml; the region falls back to default_location.
+# Nothing is deployed; names are fixtures only.
+deployment:
+  cloud: aws
+  default_location: eu-central-1
+  state_bucket_name: E2E-Example-State

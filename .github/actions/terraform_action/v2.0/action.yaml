@@ -17,7 +17,7 @@ inputs:
   no-lock:
     required: false
     description: "bool"
-    default: "true"
+    default: ""
   apply:
     required: false
     description: "bool"
@@ -89,6 +89,38 @@ inputs:
     required: false
     description: "IaC backend-config S3 region override (cloud: aws)"
     default: ""
+  aws-endpoint-url:
+    required: false
+    description: "Base endpoint for all AWS services, exported as AWS_ENDPOINT_URL to the Terraform steps only (cloud: aws)"
+    default: ""
+  aws-endpoint-url-s3:
+    required: false
+    description: "S3 endpoint for the state backend and the AWS provider, exported as AWS_ENDPOINT_URL_S3 to the Terraform steps only (cloud: aws)"
+    default: ""
+  aws-endpoint-url-sts:
+    required: false
+    description: "STS endpoint, exported as AWS_ENDPOINT_URL_STS to the Terraform steps only (cloud: aws)"
+    default: ""
+  aws-endpoint-url-iam:
+    required: false
+    description: "IAM endpoint, exported as AWS_ENDPOINT_URL_IAM to the Terraform steps only (cloud: aws)"
+    default: ""
+  aws-s3-compatible:
+    required: false
+    description: "S3-compatible storage mode: checksums only when required; backend skips region validation, account-id lookup and S3 checksums (cloud: aws)"
+    default: "false"
+  aws-skip-sts-check:
+    required: false
+    description: "Skip 'aws sts get-caller-identity' and the backend credential validation, for stores without STS (cloud: aws)"
+    default: "false"
+  backend-state-use-lockfile:
+    required: false
+    description: "S3 native state locking (use_lockfile). Disable only for S3-compatible stores without conditional writes (cloud: aws)"
+    default: "true"
+  backend-state-use-path-style:
+    required: false
+    description: "Path-style S3 addressing for the state backend (cloud: aws)"
+    default: "false"
   tfvars-file:
     required: false
     description: "IaC tfvars-file"
@@ -252,6 +284,10 @@ runs:
       fi
 
   - name: Setup Infracost
+    # Skip entirely when no key is configured. Running breakdown without a key
+    # prints Error: INFRACOST_API_KEY is not set into the log even with
+    # continue-on-error, which looks like a real failure on every plan.
+    if: inputs.INFRACOST_API_KEY != ''
     uses: infracost/actions/setup@v4
     continue-on-error: true   # allow failure for cost reporting steps
     with:
@@ -430,6 +466,54 @@ runs:
           --tenant ${{ inputs.ARM_TENANT_ID }} && az account set -s ${{ inputs.ARM_SUBSCRIPTION_ID }}
       fi
 
+  # Custom endpoints go into a file that only the Terraform/OpenTofu steps source. They are never written
+  # to GITHUB_ENV, so later steps of the calling job (e.g. the SSM keystore) keep talking to AWS.
+  - id: aws-endpoints
+    name: aws-endpoints
+    if: (inputs.cloud == 'aws')
+    shell: bash
+    env:
+      ACTION_AWS_ENDPOINT_URL: ${{ inputs.aws-endpoint-url }}
+      ACTION_AWS_ENDPOINT_URL_S3: ${{ inputs.aws-endpoint-url-s3 }}
+      ACTION_AWS_ENDPOINT_URL_STS: ${{ inputs.aws-endpoint-url-sts }}
+      ACTION_AWS_ENDPOINT_URL_IAM: ${{ inputs.aws-endpoint-url-iam }}
+      ACTION_AWS_S3_COMPATIBLE: ${{ inputs.aws-s3-compatible }}
+      ACTION_AWS_SKIP_STS_CHECK: ${{ inputs.aws-skip-sts-check }}
+      ACTION_STATE_USE_LOCKFILE: ${{ inputs.backend-state-use-lockfile }}
+      ACTION_STATE_USE_PATH_STYLE: ${{ inputs.backend-state-use-path-style }}
+    run: |
+      set -euo pipefail
+
+      for flag in ACTION_AWS_S3_COMPATIBLE ACTION_AWS_SKIP_STS_CHECK ACTION_STATE_USE_LOCKFILE ACTION_STATE_USE_PATH_STYLE; do
+        if [[ "${!flag}" != 'true' && "${!flag}" != 'false' ]]; then
+          echo "::error::${flag#ACTION_} must be 'true' or 'false' (got '${!flag}')."
+          exit 1
+        fi
+      done
+
+      env_file="${RUNNER_TEMP}/stax-aws-endpoints-${GITHUB_RUN_ID}-${GITHUB_JOB}.sh"
+      : > "$env_file"
+      for name in AWS_ENDPOINT_URL AWS_ENDPOINT_URL_S3 AWS_ENDPOINT_URL_STS AWS_ENDPOINT_URL_IAM; do
+        input="ACTION_${name}"
+        value="${!input}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ -z "$value" ]]; then continue; fi
+        if [[ "$value" == *\\* || "$value" =~ [[:space:]@?#] || ! "$value" =~ ^(https://|http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/|$)) ]] \
+          || ! node -e 'try { new URL(process.argv[1]); } catch { process.exit(1); }' "$value"; then
+          echo "::error::${name} must be a valid https URL without credentials, query or fragment (http only for localhost)."
+          exit 1
+        fi
+        printf 'export %s=%q\n' "$name" "$value" >> "$env_file"
+        echo "[INFO] ${name}=${value} (Terraform steps only)"
+      done
+      if [[ "$ACTION_AWS_S3_COMPATIBLE" == 'true' ]]; then
+        # Newer AWS SDKs send CRC checksums that many S3-compatible stores reject.
+        printf 'export %s=%q\n' AWS_REQUEST_CHECKSUM_CALCULATION when_required AWS_RESPONSE_CHECKSUM_VALIDATION when_required >> "$env_file"
+        echo "[INFO] S3-compatible mode: checksums only when required"
+      fi
+      echo "env-file=${env_file}" >> "$GITHUB_OUTPUT"
+
   - id: aws-login
     name: aws-login
     if: (inputs.local-terraform-state != 'true' && inputs.cloud == 'aws')
@@ -441,6 +525,8 @@ runs:
       ACTION_AWS_ROLE_ARN: ${{ inputs.AWS_ROLE_ARN }}
       ACTION_AWS_REGION: ${{ inputs.AWS_REGION }}
       OIDC_ENABLED: ${{ inputs.oidc-enabled }}
+      ACTION_AWS_SKIP_STS_CHECK: ${{ inputs.aws-skip-sts-check }}
+      ACTION_AWS_ENDPOINTS_FILE: ${{ steps.aws-endpoints.outputs.env-file }}
     run: |
       set -euo pipefail
 
@@ -532,7 +618,14 @@ runs:
         export AWS_SESSION_TOKEN="${SESSION_TOKEN}"
       fi
 
-      aws sts get-caller-identity
+      if [ "${ACTION_AWS_SKIP_STS_CHECK}" = "true" ]; then
+        echo "[INFO] aws-skip-sts-check: skipping 'aws sts get-caller-identity'."
+      else
+        # Checked against the custom STS endpoint, if one is configured.
+        # shellcheck disable=SC1090
+        if [ -n "${ACTION_AWS_ENDPOINTS_FILE}" ]; then source "${ACTION_AWS_ENDPOINTS_FILE}"; fi
+        aws sts get-caller-identity
+      fi
 
   - name: Validate Backend State Config
     id: validate-env
@@ -593,11 +686,18 @@ runs:
       OVERRIDE_STATE_RESOURCE_GROUP_NAME: ${{ inputs.backend-state-resource-group-name-override }}
       OVERRIDE_STATE_BUCKET_NAME: ${{ inputs.backend-state-bucket-name-override }}
       OVERRIDE_STATE_REGION: ${{ inputs.backend-state-region-override }}
+      ACTION_AWS_ENDPOINTS_FILE: ${{ steps.aws-endpoints.outputs.env-file }}
+      ACTION_AWS_S3_COMPATIBLE: ${{ inputs.aws-s3-compatible }}
+      ACTION_AWS_SKIP_STS_CHECK: ${{ inputs.aws-skip-sts-check }}
+      ACTION_STATE_USE_LOCKFILE: ${{ inputs.backend-state-use-lockfile }}
+      ACTION_STATE_USE_PATH_STYLE: ${{ inputs.backend-state-use-path-style }}
     run: |2
 
       if [[ "$ACTION_DEBUG" == 'true' ]]; then
         echo "[DEBUG] stage: ${ACTION_STAGE}, chdir: ${ACTION_CHDIR}";
       fi
+      # shellcheck disable=SC1090
+      if [[ -n "${ACTION_AWS_ENDPOINTS_FILE:-}" ]]; then source "$ACTION_AWS_ENDPOINTS_FILE"; fi
 
       tf_bin="$ACTION_IAC_PROVIDER"
       if [[ "$ACTION_IAC_PROVIDER" == 'opentofu' ]]; then tf_bin="tofu"; fi
@@ -660,19 +760,42 @@ runs:
         echo "[INFO] Running init without backend-config overrides (local terraform state)."
       elif [[ "$ACTION_CLOUD" == 'aws' ]]; then
         if [[ -n "${TF_VAR_state_bucket_name:-}" || -n "${TF_VAR_state_key:-}" ]]; then
-          # S3 native state locking: OpenTofu >= 1.10, Terraform >= 1.11. Unlocked remote state is refused.
-          lock_min="1.10.0"
-          if [[ "${tf_bin}" == 'terraform' ]]; then lock_min="1.11.0"; fi
-          if [[ "$(printf '%s\n%s\n' "$lock_min" "$tf_ver" | sort -V | head -n1)" != "$lock_min" ]]; then
-            echo "::error::${tf_bin} ${tf_ver} predates S3 native state locking (needs >= ${lock_min}). Set terraform_version / opentofu_version in the stack descriptor."
-            exit 1
+          if [[ "${ACTION_STATE_USE_LOCKFILE:-true}" == 'true' ]]; then
+            # S3 native state locking: OpenTofu >= 1.10, Terraform >= 1.11. Unlocked remote state is only
+            # accepted when explicitly configured (state_use_lockfile: false).
+            lock_min="1.10.0"
+            if [[ "${tf_bin}" == 'terraform' ]]; then lock_min="1.11.0"; fi
+            if [[ "$(printf '%s\n%s\n' "$lock_min" "$tf_ver" | sort -V | head -n1)" != "$lock_min" ]]; then
+              echo "::error::${tf_bin} ${tf_ver} predates S3 native state locking (needs >= ${lock_min}). Set terraform_version / opentofu_version in the stack descriptor."
+              exit 1
+            fi
+          else
+            echo "::warning::S3 state locking is disabled (state_use_lockfile: false). Do not run deployments of this stack concurrently."
           fi
           backend_args+=(
             "-backend-config=bucket=${TF_VAR_state_bucket_name}"
             "-backend-config=key=${TF_VAR_state_key}"
             "-backend-config=region=${TF_VAR_state_region}"
-            "-backend-config=use_lockfile=true"
           )
+          # Older Terraform/OpenTofu versions don't recognize the use_lockfile key,
+          # even when its value is false. Omit it for intentionally unlocked stores.
+          if [[ "${ACTION_STATE_USE_LOCKFILE:-true}" == 'true' ]]; then
+            backend_args+=("-backend-config=use_lockfile=true")
+          fi
+          # Endpoints reach the backend through AWS_ENDPOINT_URL_* (sourced above), not -backend-config.
+          if [[ "${ACTION_STATE_USE_PATH_STYLE:-false}" == 'true' ]]; then
+            backend_args+=("-backend-config=use_path_style=true")
+          fi
+          if [[ "${ACTION_AWS_S3_COMPATIBLE:-false}" == 'true' ]]; then
+            backend_args+=(
+              "-backend-config=skip_s3_checksum=true"
+              "-backend-config=skip_region_validation=true"
+              "-backend-config=skip_requesting_account_id=true"
+            )
+          fi
+          if [[ "${ACTION_AWS_SKIP_STS_CHECK:-false}" == 'true' ]]; then
+            backend_args+=("-backend-config=skip_credentials_validation=true")
+          fi
         else
           echo "[INFO] Running init without backend-config overrides (local/non-remote backend)."
         fi
@@ -736,6 +859,7 @@ runs:
       SOLUTION_INFRA_PROJECT: "infra-solutions"
       ACTION_DEBUG: ${{ inputs.debug }}
       ACTION_CHDIR: ${{ inputs.chdir }}
+      ACTION_CLOUD: ${{ inputs.cloud }}
       ACTION_IAC_PROVIDER: ${{ inputs.iac-provider }}
       ACTION_DESTROY: ${{ inputs.destroy }}
       ACTION_NO_LOCK: ${{ inputs.no-lock }}
@@ -746,6 +870,7 @@ runs:
       ACTION_GH_TOKEN: ${{ inputs.TF_PROVIDER_GH_TOKEN }}
       ACTION_GH_OWNER: ${{ inputs.TF_PROVIDER_GH_OWNER || github.repository_owner }}
       ACTION_PLAN_BINARY_NAME: ${{ steps.artifact-names.outputs.plan-binary-name }}
+      ACTION_AWS_ENDPOINTS_FILE: ${{ steps.aws-endpoints.outputs.env-file }}
       TF_VARS_MAP: ${{ toJSON(inputs.tf-vars) }}
       OVERRIDE_STATE_KEY: ${{ inputs.backend-state-key-override }}
       OVERRIDE_STATE_CONTAINER_NAME: ${{ inputs.backend-state-container-name-override }}
@@ -756,6 +881,8 @@ runs:
     run: |2
 
       echo "==== ${{ inputs.iac-provider == 'opentofu' && 'OpenTofu' || 'Terraform' }} Plan ===================="
+      # shellcheck disable=SC1090
+      if [[ -n "${ACTION_AWS_ENDPOINTS_FILE:-}" ]]; then source "$ACTION_AWS_ENDPOINTS_FILE"; fi
       chdir="$ACTION_CHDIR"
       tf_destroy="$ACTION_DESTROY"
       tf_bin="$ACTION_IAC_PROVIDER"
@@ -838,8 +965,10 @@ runs:
       trap - EXIT
 
       # TODO: tf root dir --> https://discuss.hashicorp.com/t/terraform-chdir-folder-isolation/24789/2
+      # An unset no-lock retains the historical Azure behavior, but S3 state locks by default.
+      # Explicit no-lock=true remains available for read-only plans (including dry runs).
       lock=""
-      if [[ "$ACTION_NO_LOCK" == 'true' ]]; then lock="-lock"; fi
+      if [[ "$ACTION_NO_LOCK" == 'true' || ( -z "$ACTION_NO_LOCK" && "$ACTION_CLOUD" != 'aws' ) ]]; then lock="-lock=false"; fi
       echo -e "\033[1;35mRun HCL Plan ${tf_bin} \
         -chdir=${chdir} tf_plan_args=${tf_plan_args} lock=$lock \
         -out ${ACTION_PLAN_BINARY_NAME}";
@@ -1022,6 +1151,7 @@ runs:
       ACTION_LOCATION: ${{ inputs.location }}
       ACTION_TF_LOG_LEVEL: ${{ inputs.tf-log-level }}
       ACTION_TF_PARALLELISM: ${{ inputs.tf-parallelism }}
+      ACTION_AWS_ENDPOINTS_FILE: ${{ steps.aws-endpoints.outputs.env-file }}
       ACTION_GH_TOKEN: ${{ inputs.TF_PROVIDER_GH_TOKEN }}
       ACTION_GH_OWNER: ${{ inputs.TF_PROVIDER_GH_OWNER || github.repository_owner }}
       TF_VARS_MAP: ${{ toJSON(inputs.tf-vars) }}
@@ -1034,6 +1164,8 @@ runs:
     run: |2
 
       echo "==== ${{ inputs.iac-provider == 'opentofu' && 'OpenTofu' || 'Terraform' }} Apply ==================="
+      # shellcheck disable=SC1090
+      if [[ -n "${ACTION_AWS_ENDPOINTS_FILE:-}" ]]; then source "$ACTION_AWS_ENDPOINTS_FILE"; fi
 
       tf_bin="$ACTION_IAC_PROVIDER"
       concise=""
@@ -1149,9 +1281,13 @@ runs:
     id: tf-out
     if: (inputs.apply == 'true' && inputs.destroy != 'true')
     shell: bash
+    env:
+      ACTION_AWS_ENDPOINTS_FILE: ${{ steps.aws-endpoints.outputs.env-file }}
     run: |2
 
       echo "==== ${{ inputs.iac-provider == 'opentofu' && 'OpenTofu' || 'Terraform' }} Output =================="
+      # shellcheck disable=SC1090
+      if [[ -n "${ACTION_AWS_ENDPOINTS_FILE:-}" ]]; then source "$ACTION_AWS_ENDPOINTS_FILE"; fi
       echo "[INFO] Generating TF Output Map..."
 
       tf_output_map_secrets='{}'
@@ -1289,7 +1425,7 @@ runs:
 
   - name: Generate Infracost diff
     shell: bash
-    if: (inputs.apply != 'true')
+    if: (inputs.apply != 'true') && (inputs.INFRACOST_API_KEY != '')
     continue-on-error: true   # allow failure for cost reporting steps
     run: |2
 
@@ -1365,7 +1501,7 @@ runs:
       overwrite: true   # Artifacts are stored persistenly on self hosted runners so we need to overwrite
 
   - uses: actions/upload-artifact@v7
-    if: (inputs.plan == 'true')
+    if: (inputs.plan == 'true') && (inputs.INFRACOST_API_KEY != '')
     name: Upload Terracost report
     with:
       name: "${{ steps.artifact-names.outputs.plan-artifacts-name }}-infracost-report"
@@ -1374,7 +1510,7 @@ runs:
       overwrite: true   # Artifacts are stored persistenly on self hosted runners so we need to overwrite
 
   - uses: actions/upload-artifact@v7
-    if: (inputs.plan == 'true')
+    if: (inputs.plan == 'true') && (inputs.INFRACOST_API_KEY != '')
     name: Upload Terracost markdown
     with:
       name: "${{ steps.artifact-names.outputs.plan-artifacts-name }}-infracost-report-md"

@@ -155,7 +155,7 @@ on:
         type: string
       actions-version:
         required: false
-        default: "1.3.3"
+        default: "1.5.0"
         description: "Github Repo branch for shared actions."
         type: string
       tfvars-file:
@@ -476,6 +476,14 @@ jobs:
         backend-state-resource-group-name-override: ${{ inputs.backend-state-resource-group-name-override }}
         backend-state-bucket-name-override: ${{ inputs.backend-state-bucket-name-override }}
         backend-state-region-override: ${{ inputs.backend-state-region-override }}
+        aws-endpoint-url: ${{ fromJson(inputs.env)['aws_endpoint_url'] || '' }}
+        aws-endpoint-url-s3: ${{ fromJson(inputs.env)['aws_endpoint_url_s3'] || '' }}
+        aws-endpoint-url-sts: ${{ fromJson(inputs.env)['aws_endpoint_url_sts'] || '' }}
+        aws-endpoint-url-iam: ${{ fromJson(inputs.env)['aws_endpoint_url_iam'] || '' }}
+        aws-s3-compatible: ${{ fromJson(inputs.env)['aws_s3_compatible'] || 'false' }}
+        aws-skip-sts-check: ${{ fromJson(inputs.env)['aws_skip_sts_check'] || 'false' }}
+        backend-state-use-lockfile: ${{ format('{0}', fromJson(inputs.env)['state_use_lockfile']) || 'true' }}
+        backend-state-use-path-style: ${{ fromJson(inputs.env)['state_use_path_style'] || 'false' }}
         tfvars-file: ${{inputs.tfvars-file != '' && format('{0}/{1}', 'source_repo' , inputs.tfvars-file) || '' }}
         tf-vars: ${{ steps.convert-inputs-ssm.outputs.tf-vars-map || steps.convert-inputs-key-vault-keystore.outputs.tf-vars-map
           || steps.convert-inputs-key-vault.outputs.tf-vars-map || steps.convert-inputs.outputs.tf-vars-map || '{}' }}
@@ -774,6 +782,14 @@ jobs:
         backend-state-resource-group-name-override: ${{ inputs.backend-state-resource-group-name-override }}
         backend-state-bucket-name-override: ${{ inputs.backend-state-bucket-name-override }}
         backend-state-region-override: ${{ inputs.backend-state-region-override }}
+        aws-endpoint-url: ${{ fromJson(inputs.env)['aws_endpoint_url'] || '' }}
+        aws-endpoint-url-s3: ${{ fromJson(inputs.env)['aws_endpoint_url_s3'] || '' }}
+        aws-endpoint-url-sts: ${{ fromJson(inputs.env)['aws_endpoint_url_sts'] || '' }}
+        aws-endpoint-url-iam: ${{ fromJson(inputs.env)['aws_endpoint_url_iam'] || '' }}
+        aws-s3-compatible: ${{ fromJson(inputs.env)['aws_s3_compatible'] || 'false' }}
+        aws-skip-sts-check: ${{ fromJson(inputs.env)['aws_skip_sts_check'] || 'false' }}
+        backend-state-use-lockfile: ${{ format('{0}', fromJson(inputs.env)['state_use_lockfile']) || 'true' }}
+        backend-state-use-path-style: ${{ fromJson(inputs.env)['state_use_path_style'] || 'false' }}
         tfvars-file: ${{inputs.tfvars-file != '' && format('{0}/{1}', 'source_repo' , inputs.tfvars-file) || '' }}
         tf-vars: ${{ steps.convert-inputs-ssm.outputs.tf-vars-map || steps.convert-inputs-key-vault-keystore.outputs.tf-vars-map
           || steps.convert-inputs-key-vault.outputs.tf-vars-map || steps.convert-inputs.outputs.tf-vars-map || '{}' }}
